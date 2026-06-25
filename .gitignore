@@ -1,0 +1,4 @@
+/target
+test_file
+other_test_file
+*.sqlite
