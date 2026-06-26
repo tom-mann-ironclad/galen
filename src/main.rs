@@ -1,7 +1,9 @@
 pub mod cli;
 pub mod scanner;
+pub mod updater;
 
 use crate::scanner::{database::load_hash_database, scan::scan_path};
+use crate::updater::update::update_using_malware_bazaar;
 
 use crate::cli::{Command, parse_args};
 
@@ -29,9 +31,19 @@ fn main() {
             std::process::exit(0);
         }
 
-        Ok(Command::Update(_args)) => {
-            eprintln!("Do any update please!");
-            todo!();
+        Ok(Command::Update(args)) => {
+            eprintln!("Upating malware signatures...");
+            let auth_key = "9932f3d4a3e874629ac281162c5dfe2a78baadd4276cd065";
+            match update_using_malware_bazaar(auth_key, "100", args.database) {
+                Ok(inserted) => {
+                    println!("Updated {:?} signatures from Malware Bazaar", inserted);
+                    std::process::exit(0);
+                }
+                Err(err) => {
+                    println!("Error - Failed to update from Malware Bazaar: {}", err);
+                    std::process::exit(2);
+                }
+            }
         }
 
         Ok(Command::Help) => {

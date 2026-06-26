@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+const DEFAULT_DATABASE: &str = "./signature_database.sqlite";
+
 /// Commands which the user can use with the CLI.
 pub enum Command {
     Scan(ScanArgs),
@@ -19,6 +21,8 @@ pub struct ScanArgs {
 pub struct UpdateArgs {
     /// The source to use when updating.
     pub source: String,
+    /// The database to be updated.
+    pub database: PathBuf,
 }
 
 /// Function to parse the arguments passed to the CLI.
@@ -49,7 +53,7 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut target: Option<PathBuf> = None;
-    let mut database = PathBuf::from("./signature_database.sqlite");
+    let mut database = PathBuf::from(DEFAULT_DATABASE);
 
     let mut args = args.into_iter();
 
@@ -111,5 +115,8 @@ where
         }
     }
 
-    Ok(Command::Update(UpdateArgs { source }))
+    Ok(Command::Update(UpdateArgs {
+        source,
+        database: PathBuf::from(DEFAULT_DATABASE),
+    }))
 }

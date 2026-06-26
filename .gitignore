@@ -1,4 +1,3 @@
 /target
-test_file
-other_test_file
+/test_files
 *.sqlite
