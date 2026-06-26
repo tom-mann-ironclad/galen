@@ -1,10 +1,7 @@
 pub mod cli;
 pub mod scanner;
 
-use crate::scanner::{
-    database::load_hash_database,
-    scan::{ScanResult, scan_file},
-};
+use crate::scanner::{database::load_hash_database, scan::scan_path};
 
 use crate::cli::{Command, parse_args};
 
@@ -15,23 +12,21 @@ fn main() {
             eprintln!("Loading {:#?} signature database...", args.database);
             let hash_database = load_hash_database(args.database).unwrap();
             eprintln!("{:?} signatures loaded", hash_database.len());
-            let result = scan_file(args.target, &hash_database).unwrap();
-            match result {
-                ScanResult::Clean => {
-                    println!("No known threats detected.");
-                    std::process::exit(0);
-                }
-                ScanResult::KnownHash { family } => {
-                    println!(
-                        "THREAT DETECTED: known hash {}",
-                        family
-                            .as_deref()
-                            .map(|name| format!("({name})"))
-                            .unwrap_or_else(|| "(unknown family)".to_string())
-                    );
-                    std::process::exit(1);
-                }
+            let summary = scan_path(&args.target, &hash_database);
+            println!();
+            println!("Scanned {} files", summary.files_scanned);
+            println!("Threats detected: {}", summary.threats_detected);
+
+            if summary.errors > 0 {
+                println!("Errors: {}", summary.errors);
+                std::process::exit(2);
             }
+
+            if summary.threats_detected > 0 {
+                std::process::exit(1);
+            }
+
+            std::process::exit(0);
         }
 
         Ok(Command::Update(_args)) => {
