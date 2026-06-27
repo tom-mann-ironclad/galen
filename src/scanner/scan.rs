@@ -7,6 +7,8 @@ pub struct ScanSummaryStats {
     pub files_scanned: u64,
     pub threats_detected: u64,
     pub errors: u64,
+    pub files_skipped: u64,
+    pub files_skipped_zero_size: u64,
 }
 
 impl ScanSummaryStats {
@@ -52,6 +54,22 @@ fn scan_file(path: impl AsRef<Path>, hash_database: &HashDatabase) -> Result<Sca
 
 /// Function to scan a file and report the results by modifying the provided summary.
 fn scan_one_and_report(path: &Path, hash_database: &HashDatabase, summary: &mut ScanSummaryStats) {
+    let metadata = match path.metadata() {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            summary.errors += 1;
+            eprintln!("Unable to read metadata for {:?}: {}", path.display(), err);
+            return;
+        }
+    };
+
+    // Guard to avoid wasting time scanning 0 size files
+    if metadata.len() == 0 {
+        summary.files_skipped += 1;
+        summary.files_skipped_zero_size += 1;
+        return;
+    }
+
     match scan_file(path, hash_database) {
         Ok(ScanResult::Clean) => {
             summary.files_scanned += 1;

@@ -17,6 +17,8 @@ fn main() {
             let summary = scan_path(&args.target, &hash_database);
             println!();
             println!("Scanned {} files", summary.files_scanned);
+            println!("Skipped {} files", summary.files_skipped);
+            println!("  zero-size {}", summary.files_skipped_zero_size);
             println!("Threats detected: {}", summary.threats_detected);
 
             if summary.errors > 0 {
