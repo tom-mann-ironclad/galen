@@ -23,6 +23,8 @@ pub struct UpdateArgs {
     pub source: String,
     /// The database to be updated.
     pub database: PathBuf,
+    /// The Malware Bazaar auth key.
+    pub auth_key: String,
 }
 
 /// Function to parse the arguments passed to the CLI.
@@ -95,7 +97,11 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut source = String::from("local");
-
+    // let auth_key = "9932f3d4a3e874629ac281162c5dfe2a78baadd4276cd065";
+    let auth_key = match std::env::var("GALEN_AUTH_KEY") {
+        Ok(key) => key,
+        Err(err) => return Err(err.to_string()),
+    };
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -118,5 +124,6 @@ where
     Ok(Command::Update(UpdateArgs {
         source,
         database: PathBuf::from(DEFAULT_DATABASE),
+        auth_key,
     }))
 }

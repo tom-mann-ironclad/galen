@@ -32,11 +32,10 @@ fn main() {
         }
 
         Ok(Command::Update(args)) => {
-            eprintln!("Upating malware signatures...");
-            let auth_key = "9932f3d4a3e874629ac281162c5dfe2a78baadd4276cd065";
-            match update_using_malware_bazaar(auth_key, "100", args.database) {
+            eprintln!("Updating malware signatures...");
+            match update_using_malware_bazaar(&args.auth_key, "100", args.database) {
                 Ok(inserted) => {
-                    println!("Updated {:?} signatures from Malware Bazaar", inserted);
+                    println!("Processed {:?} signatures from Malware Bazaar", inserted);
                     std::process::exit(0);
                 }
                 Err(err) => {
