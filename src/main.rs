@@ -2,8 +2,8 @@ pub mod cli;
 pub mod scanner;
 pub mod updater;
 
-use crate::scanner::{database::load_hash_database, scan::scan_path};
-use crate::updater::update::update_using_malware_bazaar;
+use crate::scanner::{database::load_hash_database, yara::load_yara_rules_cache, scan::scan_path};
+use crate::updater::{update_signatures::update_signatures_using_malware_bazaar, update_yara_rules::update_yara_rules};
 
 use crate::cli::{Command, parse_args};
 
@@ -14,7 +14,12 @@ fn main() {
             eprintln!("Loading {:#?} signature database...", args.database);
             let hash_database = load_hash_database(args.database).unwrap();
             eprintln!("{:?} signatures loaded", hash_database.len());
-            let summary = scan_path(&args.target, &hash_database);
+
+            eprintln!("Loading {:#?} YARA rules cache...", args.yara_rules_cache);
+            let rules = load_yara_rules_cache(args.yara_rules_cache).unwrap();
+            let mut yara_scanner = yara_x::Scanner::new(&rules);
+            
+            let summary = scan_path(&args.target, &hash_database, &mut yara_scanner);
             println!();
             println!("Scanned {} files", summary.files_scanned);
             println!("Skipped {} files", summary.files_skipped);
@@ -35,16 +40,29 @@ fn main() {
 
         Ok(Command::Update(args)) => {
             eprintln!("Updating malware signatures...");
-            match update_using_malware_bazaar(&args.auth_key, "100", args.database) {
+            match update_signatures_using_malware_bazaar(&args.auth_key, "100", args.database) {
                 Ok(inserted) => {
                     println!("Processed {:?} signatures from Malware Bazaar", inserted);
-                    std::process::exit(0);
                 }
                 Err(err) => {
-                    println!("Error - Failed to update from Malware Bazaar: {}", err);
+                    println!("Error - Failed to update signatures from Malware Bazaar: {}", err);
                     std::process::exit(2);
                 }
-            }
+            };
+
+            eprintln!("Updating YARA rules...");
+            match update_yara_rules(&args.yara_rules_path, &args.yara_rules_cache) {
+                Ok(compiled) => {
+                    println!("Compiled {:?} rules into cache", compiled);
+                }
+                Err(err) => {
+                    println!("Error - Failed to update YARA rules: {}", err);
+                    std::process::exit(2);
+                }
+
+            };
+
+            std::process::exit(0);
         }
 
         Ok(Command::Help) => {
@@ -64,8 +82,8 @@ fn print_help() {
     println!(
         "\
 Usage:
-  galen scan <target> [--db <path>]
-  galen update [--source <name>]
+  galen scan <target> [--database <path>] [--yara-cache <path>]
+  galen update
   galen --help
 
 Commands:
@@ -73,9 +91,9 @@ Commands:
   update    Update local signatures
 
 Options:
-  -d, --db <path>        Path to signature database
-  -s, --source <name>    Signature source
-  -h, --help             Show this help text
+  -d, --database <path>   Path to signature database
+  -y, --yara-cache <path> Path to YARA rules directory
+  -h, --help              Show this help text
 "
     );
 }

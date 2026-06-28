@@ -1,3 +1,6 @@
+TODO*
 /target
 /test_files
+
 *.sqlite
+/yara

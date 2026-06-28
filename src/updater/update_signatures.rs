@@ -39,7 +39,7 @@ struct MalwareBazaarSample {
 }
 
 /// Function to update the signatures database from Malware Bazaar.
-pub fn update_using_malware_bazaar(
+pub fn update_signatures_using_malware_bazaar(
     auth_key: &str,
     selector: &str,
     db_path: impl AsRef<Path>,

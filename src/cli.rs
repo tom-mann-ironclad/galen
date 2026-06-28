@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 const DEFAULT_DATABASE: &str = "./signature_database.sqlite";
+const DEFAULT_YARA_DIR: &str = "./yara/";
+const DEFAULT_YARA_CACHE: &str = "./yara/compiled/galen.yaraxc";
 
 /// Commands which the user can use with the CLI.
 pub enum Command {
@@ -15,16 +17,20 @@ pub struct ScanArgs {
     pub target: PathBuf,
     /// The signatures database to use.
     pub database: PathBuf,
+    /// The compiled YARA rules cache.
+    pub yara_rules_cache: PathBuf,
 }
 
 /// The arguments which an `Update` command needs.
 pub struct UpdateArgs {
-    /// The source to use when updating.
-    pub source: String,
     /// The database to be updated.
     pub database: PathBuf,
     /// The Malware Bazaar auth key.
     pub auth_key: String,
+    /// The YARA rules storage location on disk.
+    pub yara_rules_path: PathBuf,
+    /// The compiled YARA rules cache.
+    pub yara_rules_cache: PathBuf,
 }
 
 /// Function to parse the arguments passed to the CLI.
@@ -56,6 +62,7 @@ where
 {
     let mut target: Option<PathBuf> = None;
     let mut database = PathBuf::from(DEFAULT_DATABASE);
+    let mut yara_rules_cache = PathBuf::from(DEFAULT_YARA_CACHE);
 
     let mut args = args.into_iter();
 
@@ -67,6 +74,13 @@ where
                 };
 
                 database = PathBuf::from(value);
+            }
+
+            "--yara-cache" | "-y" => {
+                let Some(value) = args.next() else {
+                    return Err("No arguments provided".to_string());
+                };
+                yara_rules_cache = PathBuf::from(value);
             }
 
             value if value.starts_with("-") => {
@@ -89,41 +103,32 @@ where
         return Err("No scan target provided".to_string());
     };
 
-    Ok(Command::Scan(ScanArgs { target, database }))
+    Ok(Command::Scan(ScanArgs { target, database, yara_rules_cache }))
 }
 
 fn parse_update<I>(args: I) -> Result<Command, String>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut source = String::from("local");
-    // let auth_key = "9932f3d4a3e874629ac281162c5dfe2a78baadd4276cd065";
     let auth_key = match std::env::var("GALEN_AUTH_KEY") {
         Ok(key) => key,
         Err(err) => return Err(err.to_string()),
     };
     let mut args = args.into_iter();
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--source" | "-s" => {
-                let Some(value) = args.next() else {
-                    return Err("No arguments provided".to_string());
-                };
-
-                source = value;
-            }
-
+    if let Some(arg) = args.next() {
             // Guard to catch invalid parameters
-            _value => {
+            let _value = arg.as_str();
+            {
                 return Err("Unknown parameter provided".to_string());
             }
-        }
+        
     }
 
     Ok(Command::Update(UpdateArgs {
-        source,
         database: PathBuf::from(DEFAULT_DATABASE),
         auth_key,
+        yara_rules_path: PathBuf::from(DEFAULT_YARA_DIR),
+        yara_rules_cache: PathBuf::from(DEFAULT_YARA_CACHE),
     }))
 }
