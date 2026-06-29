@@ -26,9 +26,14 @@ fn compile_yara_cache(rules_dir: &Path, cache_path: &Path) -> Result<usize, Box<
     let mut compiler = yara_x::Compiler::new();
 
     for path in rules_paths {
-        let raw_source = std::fs::read_to_string(path)?;
+        let raw_source = std::fs::read_to_string(&path)?;
         let source: &str = &raw_source; 
-        let _  = compiler.add_source(yara_x::SourceCode::from(source));
+        match compiler.add_source(yara_x::SourceCode::from(source)) {
+            Ok(_) => {},
+            Err(err) => {
+                return Err(format!("Unable to add rules from {}: {}", path.display(), err).into());
+            }
+        };
     }
 
     let rules = compiler.build();
@@ -44,7 +49,7 @@ fn compile_yara_cache(rules_dir: &Path, cache_path: &Path) -> Result<usize, Box<
         let file = std::fs::File::create(&tmp_path)?;
         let writer = std::io::BufWriter::new(file);
 
-        let _ = rules.serialize_into(writer);
+        rules.serialize_into(writer)?;
     }
 
     std::fs::rename(&tmp_path, cache_path)?;
