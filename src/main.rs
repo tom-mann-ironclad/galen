@@ -12,11 +12,24 @@ fn main() {
     match parse_args(std::env::args()) {
         Ok(Command::Scan(args)) => {
             eprintln!("Loading {:#?} signature database...", args.database);
-            let hash_database = load_hash_database(args.database).unwrap();
+            let hash_database = match load_hash_database(args.database) {
+                Ok(database) => database,
+                Err(err) => {
+                    eprintln!("Unable to load signature database: {}", err);
+                    std::process::exit(2);
+                }
+            };
             eprintln!("{:?} signatures loaded", hash_database.len());
 
             eprintln!("Loading {:#?} YARA rules cache...", args.yara_rules_cache);
-            let rules = load_yara_rules_cache(args.yara_rules_cache).unwrap();
+            let rules = match load_yara_rules_cache(args.yara_rules_cache) {
+                Ok(cache) => cache,
+                Err(err) => {
+                    eprintln!("Unable to load YARA rules cache: {}", err);
+                    std::process::exit(2);
+                }
+            };
+
             let mut yara_scanner = yara_x::Scanner::new(&rules);
             
             let summary = scan_path(&args.target, &hash_database, &mut yara_scanner);
