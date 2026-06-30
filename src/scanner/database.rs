@@ -1,5 +1,5 @@
 use super::hash::FileHashes;
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use std::path::Path;
 
 const SHA256_QUERY: &str = "SELECT sha256 FROM malware_hashes ORDER BY sha256";
@@ -53,27 +53,4 @@ pub fn load_hash_database(path: impl AsRef<Path>) -> Result<HashDatabase, rusqli
     database.sha256.dedup();
 
     Ok(database)
-}
-
-pub fn insert_test_hash(path: impl AsRef<Path>) -> Result<(), rusqlite::Error> {
-    let connection = Connection::open(path)?;
-    let sha256: [u8; 32] = [
-        100, 155, 139, 71, 30, 125, 123, 193, 117, 238, 199, 88, 167, 0, 106, 198, 147, 196, 52,
-        200, 41, 124, 7, 219, 21, 40, 103, 136, 200, 55, 21, 74,
-    ];
-    {
-        connection.execute(
-            r#"
-        INSERT INTO malware_hashes (
-            sha256,
-            family,
-            source
-        )
-        VALUES (?1, ?2, ?3)
-        "#,
-            params![sha256.as_slice(), "test-family", "manual-test",],
-        )?;
-    }
-
-    Ok(())
 }

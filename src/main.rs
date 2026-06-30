@@ -2,8 +2,10 @@ pub mod cli;
 pub mod scanner;
 pub mod updater;
 
-use crate::scanner::{database::load_hash_database, yara::load_yara_rules_cache, scan::scan_path};
-use crate::updater::{update_signatures::update_signatures_using_malware_bazaar, update_yara_rules::update_yara_rules};
+use crate::scanner::{database::load_hash_database, scan::scan_path, yara::load_yara_rules_cache};
+use crate::updater::{
+    update_signatures::update_signatures_using_malware_bazaar, update_yara_rules::update_yara_rules,
+};
 
 use crate::cli::{Command, parse_args};
 
@@ -31,7 +33,13 @@ fn main() {
             };
 
             let mut yara_scanner = yara_x::Scanner::new(&rules);
-            
+            yara_scanner
+                .fast_scan(true)
+                .max_matches_per_pattern(8)
+                .max_scan_size(4 * 1024 * 1024)
+                .use_mmap(false)
+                .set_timeout(std::time::Duration::from_secs(10));
+
             let summary = scan_path(&args.target, &hash_database, &mut yara_scanner);
             println!();
             println!("Scanned {} files", summary.files_scanned);
@@ -58,7 +66,10 @@ fn main() {
                     println!("Processed {:?} signatures from Malware Bazaar", inserted);
                 }
                 Err(err) => {
-                    println!("Error - Failed to update signatures from Malware Bazaar: {}", err);
+                    println!(
+                        "Error - Failed to update signatures from Malware Bazaar: {}",
+                        err
+                    );
                     std::process::exit(2);
                 }
             };
@@ -72,7 +83,6 @@ fn main() {
                     println!("Error - Failed to update YARA rules: {}", err);
                     std::process::exit(2);
                 }
-
             };
 
             std::process::exit(0);

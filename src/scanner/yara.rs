@@ -1,4 +1,4 @@
-use std::{path::Path, io::BufReader, fs::File};
+use std::{fs::File, io::BufReader, path::Path};
 use yara_x::Rules;
 
 /// Function to load a compiled YARA rules cache from disk.

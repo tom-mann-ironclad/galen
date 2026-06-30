@@ -103,7 +103,11 @@ where
         return Err("No scan target provided".to_string());
     };
 
-    Ok(Command::Scan(ScanArgs { target, database, yara_rules_cache }))
+    Ok(Command::Scan(ScanArgs {
+        target,
+        database,
+        yara_rules_cache,
+    }))
 }
 
 fn parse_update<I>(args: I) -> Result<Command, String>
@@ -117,12 +121,11 @@ where
     let mut args = args.into_iter();
 
     if let Some(arg) = args.next() {
-            // Guard to catch invalid parameters
-            let _value = arg.as_str();
-            {
-                return Err("Unknown parameter provided".to_string());
-            }
-        
+        // Guard to catch invalid parameters
+        let _value = arg.as_str();
+        {
+            return Err("Unknown parameter provided".to_string());
+        }
     }
 
     Ok(Command::Update(UpdateArgs {

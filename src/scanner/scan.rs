@@ -122,22 +122,26 @@ fn scan_one_and_report(
         }
 
         ScanResult::Clean => {
-            let yara_result = match scan_file_yara(path, yara_scanner) {
-                Ok(result) => result,
-                Err(err) => {
-                    summary.errors += 1;
-                    eprintln!("Could not scan {}: {}", path.display(), err);
-                    return;
-                }
-            };
+            if metadata.len() > 32 {
+                let yara_result = match scan_file_yara(path, yara_scanner) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        summary.errors += 1;
+                        eprintln!("Could not scan {}: {}", path.display(), err);
+                        return;
+                    }
+                };
 
-            match yara_result {
-                ScanResult::Clean => {
-                    summary.files_scanned += 1;
+                match yara_result {
+                    ScanResult::Clean => {
+                        summary.files_scanned += 1;
+                    }
+                    ScanResult::ThreatDetected { detection_type } => {
+                        handle_threat_detected(detection_type, path, summary);
+                    }
                 }
-                ScanResult::ThreatDetected { detection_type } => {
-                    handle_threat_detected(detection_type, path, summary);
-                }
+            } else {
+                summary.files_scanned += 1;
             }
         }
     }
@@ -157,14 +161,14 @@ fn handle_threat_detected(
                 Some(name) => name,
                 None => "unknown family".to_string(),
             };
-            println!("THREAT DETECTED: known hash ({})", family_name)
+            // println!("THREAT DETECTED: known hash ({})", family_name)
         }
         DetectionType::YaraRule { rule } => {
-            println!("THREAT DETECTED: YARA rule match ({})", rule)
+            // println!("THREAT DETECTED: YARA rule match ({})", rule)
         }
     }
 
-    println!("  {:?}", path.display());
+    // println!("  {:?}", path.display());
 }
 
 /// Function to scan a provided directory and update the provided summary.
