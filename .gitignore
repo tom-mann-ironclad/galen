@@ -1,6 +1,6 @@
 TODO*
 /target
 /test_files
-
+*.log
 *.sqlite
 /yara

@@ -1,14 +1,22 @@
+use super::heuristics::{
+    Confidence, Finding, FindingId, HeuristicAccumulator, MAX_FINDINGS_PER_FILE, Verdict,
+};
+use super::yara::{MatchedYaraRule, YaraRuleClass, score_matched_rule};
 use super::{database::HashDatabase, hash::hash_file};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default)]
 /// The stats from scanning a given file/directory path.
 pub struct ScanSummaryStats {
     pub files_scanned: u64,
-    pub threats_detected: u64,
+    pub known_hash_detections: u64,
+    pub yara_detections: u64,
     pub errors: u64,
     pub files_skipped: u64,
     pub files_skipped_zero_size: u64,
+    pub yara_rules_triggered: HashMap<String, u64>,
+    pub detections: Vec<DetectionRecord>,
 }
 
 impl ScanSummaryStats {
@@ -18,18 +26,26 @@ impl ScanSummaryStats {
     }
 }
 
-/// The result of scanning a single file.
 #[derive(Debug)]
-enum ScanResult {
-    Clean,
-    ThreatDetected { detection_type: DetectionType },
+pub struct DetectionRecord {
+    pub path: PathBuf,
+    pub score: u16,
+    pub verdict: Verdict,
+    pub findings: [Option<Finding>; MAX_FINDINGS_PER_FILE],
 }
 
-/// The type of detection made.
+/// The result of scanning a single file to compare it's hash.
 #[derive(Debug)]
-enum DetectionType {
+enum HashScanResult {
+    Clean,
     KnownHash { family: Option<String> },
-    YaraRule { rule: String },
+}
+
+/// The result of scanning a single file against YARA rules.
+#[derive(Debug)]
+enum YaraScanResult {
+    Clean,
+    YaraRules { rules: Vec<MatchedYaraRule> },
 }
 
 pub fn scan_path(
@@ -55,33 +71,37 @@ pub fn scan_path(
 fn scan_file_hashes(
     path: impl AsRef<Path>,
     hash_database: &HashDatabase,
-) -> Result<ScanResult, String> {
+) -> Result<HashScanResult, String> {
     let hashes = match hash_file(path) {
         Err(_) => return Err("Unable to compare hash".to_string()),
         Ok(hashes) => hashes,
     };
     if hash_database.contains(&hashes) {
-        return Ok(ScanResult::ThreatDetected {
-            detection_type: DetectionType::KnownHash { family: None },
-        });
+        return Ok(HashScanResult::KnownHash { family: None });
     };
-    Ok(ScanResult::Clean)
+    Ok(HashScanResult::Clean)
 }
 
-fn scan_file_yara(path: &Path, scanner: &mut yara_x::Scanner) -> Result<ScanResult, String> {
+fn scan_file_yara(path: &Path, scanner: &mut yara_x::Scanner) -> Result<YaraScanResult, String> {
     let results = match scanner.scan_file(path) {
         Ok(results) => results,
         Err(err) => return Err(err.to_string()),
     };
-    if let Some(matched_rule) = results.matching_rules().next() {
-        return Ok(ScanResult::ThreatDetected {
-            detection_type: DetectionType::YaraRule {
-                rule: matched_rule.identifier().to_string(),
-            },
-        });
+
+    // Guard to catch clean scans without allocating.
+    if results.matching_rules().len() == 0 {
+        return Ok(YaraScanResult::Clean);
     }
 
-    Ok(ScanResult::Clean)
+    let mut matched_rules = Vec::new();
+    
+    for rule in results.matching_rules() {
+        matched_rules.push(MatchedYaraRule::from_yara_rule(rule));
+    }
+
+    Ok(YaraScanResult::YaraRules {
+        rules: matched_rules,
+    })
 }
 
 /// Function to scan a file and report the results by modifying the provided summary.
@@ -91,6 +111,7 @@ fn scan_one_and_report(
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
 ) {
+    let mut heuristics = HeuristicAccumulator::new();
     let metadata = match path.metadata() {
         Ok(metadata) => metadata,
         Err(err) => {
@@ -107,6 +128,7 @@ fn scan_one_and_report(
         return;
     }
 
+    // Hash the file and compare
     let hash_result = match scan_file_hashes(path, hash_database) {
         Ok(result) => result,
         Err(err) => {
@@ -117,58 +139,66 @@ fn scan_one_and_report(
     };
 
     match hash_result {
-        ScanResult::ThreatDetected { detection_type } => {
-            handle_threat_detected(detection_type, path, summary);
+        HashScanResult::Clean => {}
+        HashScanResult::KnownHash { family: _ } => {
+            summary.known_hash_detections += 1;
+            heuristics.add(Finding {
+                id: FindingId::KnownHash,
+                score: 100,
+                confidence: Confidence::High,
+            });
         }
+    }
 
-        ScanResult::Clean => {
-            if metadata.len() > 32 {
-                let yara_result = match scan_file_yara(path, yara_scanner) {
-                    Ok(result) => result,
-                    Err(err) => {
-                        summary.errors += 1;
-                        eprintln!("Could not scan {}: {}", path.display(), err);
-                        return;
-                    }
-                };
+    // Run YARA rules scan
+    if metadata.len() > 32 {
+        let yara_result = match scan_file_yara(path, yara_scanner) {
+            Ok(result) => result,
+            Err(err) => {
+                summary.errors += 1;
+                eprintln!("Could not scan {}: {}", path.display(), err);
+                return;
+            }
+        };
 
-                match yara_result {
-                    ScanResult::Clean => {
-                        summary.files_scanned += 1;
-                    }
-                    ScanResult::ThreatDetected { detection_type } => {
-                        handle_threat_detected(detection_type, path, summary);
-                    }
+        match yara_result {
+            YaraScanResult::Clean => {}
+            YaraScanResult::YaraRules { rules } => {
+                summary.yara_detections += 1;
+                for rule in rules {
+                    *summary.yara_rules_triggered.entry(rule.name).or_insert(0) += 1;
+                    let (score, confidence) = score_matched_rule(&rule.class, &rule.strength);
+                    let finding = match &rule.class {
+                        YaraRuleClass::Persistence => FindingId::YaraPersistenceIndicator,
+                        YaraRuleClass::PackerOrObfuscation => FindingId::YaraPackerIndicator,
+                        YaraRuleClass::WebShell => FindingId::YaraRootkitIndicator,
+                        _ => FindingId::SingleYaraRule
+                    };
+                    heuristics.add(Finding {
+                        id: finding,
+                        score,
+                        confidence,
+                    });
+
                 }
-            } else {
-                summary.files_scanned += 1;
             }
         }
     }
-}
 
-fn handle_threat_detected(
-    detection_type: DetectionType,
-    path: &Path,
-    summary: &mut ScanSummaryStats,
-) {
+    // Summarise scan and report
     summary.files_scanned += 1;
-    summary.threats_detected += 1;
-
-    match detection_type {
-        DetectionType::KnownHash { family } => {
-            let family_name = match family {
-                Some(name) => name,
-                None => "unknown family".to_string(),
-            };
-            // println!("THREAT DETECTED: known hash ({})", family_name)
+    let verdict = heuristics.verdict();
+    match verdict {
+        Verdict::Clean => {}
+        _ => {
+            summary.detections.push(DetectionRecord {
+                path: path.to_path_buf(),
+                score: heuristics.score(),
+                verdict,
+                findings: heuristics.findings(),
+            });
         }
-        DetectionType::YaraRule { rule } => {
-            // println!("THREAT DETECTED: YARA rule match ({})", rule)
-        }
-    }
-
-    // println!("  {:?}", path.display());
+    };
 }
 
 /// Function to scan a provided directory and update the provided summary.

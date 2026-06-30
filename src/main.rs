@@ -2,7 +2,7 @@ pub mod cli;
 pub mod scanner;
 pub mod updater;
 
-use crate::scanner::{database::load_hash_database, scan::scan_path, yara::load_yara_rules_cache};
+use crate::scanner::{database::load_hash_database, scan::scan_path, yara::load_yara_rules_cache, heuristics::Verdict};
 use crate::updater::{
     update_signatures::update_signatures_using_malware_bazaar, update_yara_rules::update_yara_rules,
 };
@@ -39,20 +39,45 @@ fn main() {
                 .max_scan_size(4 * 1024 * 1024)
                 .use_mmap(false)
                 .set_timeout(std::time::Duration::from_secs(10));
+            eprintln!("{:?} rules loaded", rules.iter().len());
 
+            eprintln!("Starting scan...");
             let summary = scan_path(&args.target, &hash_database, &mut yara_scanner);
             println!();
             println!("Scanned {} files", summary.files_scanned);
             println!("Skipped {} files", summary.files_skipped);
             println!("  zero-size {}", summary.files_skipped_zero_size);
-            println!("Threats detected: {}", summary.threats_detected);
+            if summary.known_hash_detections != 0 {
+                println!("{} known hash detections", summary.known_hash_detections);
+            }
+            if !summary.yara_rules_triggered.is_empty() {
+                println!(
+                    "{} YARA rules triggered",
+                    summary.yara_rules_triggered.len()
+                );
+
+                let mut rules: Vec<_> = summary.yara_rules_triggered.iter().collect();
+                rules.sort_by_key(|(rule, _count)| rule.as_str());
+
+                for (rule, count) in rules {
+                    println!("  {}: {} files", rule, count);
+                }
+            }
+
+            let mut threats_detected = false;
+            for record in summary.detections {
+                if record.verdict >= Verdict::Suspicious {
+                    println!("{:?}", record);
+                    threats_detected = true;
+                }
+            }
 
             if summary.errors > 0 {
                 println!("Errors: {}", summary.errors);
                 std::process::exit(2);
             }
 
-            if summary.threats_detected > 0 {
+            if threats_detected {
                 std::process::exit(1);
             }
 
