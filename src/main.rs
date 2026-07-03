@@ -51,7 +51,11 @@ fn main() {
             println!();
             println!("Scanned {} files", summary.files_scanned);
             println!("Skipped {} files", summary.files_skipped);
-            println!("  potential zip bomb {}", summary.files_scanned_too_large_when_uncompressed + summary.files_scanned_max_recursion);
+            println!(
+                "  potential zip bomb {}",
+                summary.files_scanned_too_large_when_uncompressed
+                    + summary.files_scanned_max_recursion
+            );
             println!("  zero-size {}", summary.files_skipped_zero_size);
             if summary.known_hash_detections != 0 {
                 println!("{} known hash detections", summary.known_hash_detections);

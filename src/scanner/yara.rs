@@ -79,7 +79,7 @@ fn classify_yara_rule<'a>(
     );
 
     let mut saw_eicar = contains_class_hint(identifier, &["eicar", "EICAR", "Eicar"]);
-    
+
     let mut saw_amtso = contains_class_hint(identifier, &["amtso", "AMTSO", "Atmtso"]);
 
     let mut saw_packer =
@@ -167,15 +167,10 @@ fn infer_persistence_strength<'a>(
             v.contains("bashrc") || v.contains("profile") || v.contains("autostart");
     }
 
-    let hits = [
-        saw_ld_preload,
-        saw_cron,
-        saw_systemd,
-        saw_shell_startup,
-    ]
-    .into_iter()
-    .filter(|seen| *seen)
-    .count();
+    let hits = [saw_ld_preload, saw_cron, saw_systemd, saw_shell_startup]
+        .into_iter()
+        .filter(|seen| *seen)
+        .count();
 
     match hits {
         0 | 1 => RuleStrength::GenericPrimitive,

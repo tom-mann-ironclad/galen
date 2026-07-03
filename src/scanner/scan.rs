@@ -27,6 +27,7 @@ pub struct ScanSummaryStats {
     pub files_skipped_encrypted: u64,
     pub files_scanned_too_large_when_uncompressed: u64,
     pub files_scanned_max_recursion: u64,
+    pub skipped_unsupported_archive_entries: u64,
     pub yara_rules_triggered: HashMap<String, u64>,
     pub detections: Vec<DetectionRecord>,
 }
@@ -58,6 +59,14 @@ enum HashScanResult {
 enum YaraScanResult {
     Clean,
     YaraRules { rules: Vec<MatchedYaraRule> },
+}
+
+/// Enum to represent different types of archive which can be scanned.
+enum ArchiveKind {
+    Zip,
+    Tar,
+    Gzip,
+    Unknown,
 }
 
 pub fn scan_path(
@@ -215,12 +224,36 @@ fn scan_one_and_report(
     // Run heavier rules scan
     if metadata.len() > 32 {
         // Check if we're attempting to scan an archive.
-        let looks_like_zip = match looks_like_zip_file(path) {
-            Ok(decision) => decision,
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(err) => {
+                summary.errors += 1;
+                eprintln!("Could not scan {}: {}", path.display(), err);
+                return;
+            }
+        };
+
+        // ZIP needs 4 bytes.
+        // GZIP needs 2 bytes.
+        // TAR detection usually needs 512 bytes.
+        let mut buf = [0_u8; 512];
+        let bytes_read = match file.read(&mut buf) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                summary.errors += 1;
+                eprintln!("Could not scan {}: {}", path.display(), err);
+                return;
+            }
+        };
+
+        let sample = &buf[..bytes_read];
+
+        let archive_kind = match detect_archive_kind(sample, path) {
+            Ok(kind) => kind,
             Err(err) => {
                 summary.errors += 1;
                 eprintln!(
-                    "Could not determine if {} is a zip archive: {}",
+                    "Could not determine if {} is an archive: {}",
                     path.display(),
                     err
                 );
@@ -228,16 +261,30 @@ fn scan_one_and_report(
             }
         };
 
-        if looks_like_zip {
-            summary.archives_scanned += 1;
-            match scan_zip_file(path, hash_database, yara_scanner, summary) {
-                Ok(result) => result,
-                Err(err) => {
-                    summary.errors += 1;
-                    eprintln!("Could not scan {}: {}", path.display(), err);
+        match archive_kind {
+            ArchiveKind::Unknown => {}
+            ArchiveKind::Zip => {
+                summary.archives_scanned += 1;
+                match scan_zip_file(path, hash_database, yara_scanner, summary) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        summary.errors += 1;
+                        eprintln!("Could not scan {}: {}", path.display(), err);
+                    }
+                };
+            }
+            ArchiveKind::Tar => {
+                summary.archives_scanned += 1;
+                match scan_tar_file(path, hash_database, yara_scanner, summary) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        summary.errors += 1;
+                        eprintln!("Could not scan {}: {}", path.display(), err);
+                    }
                 }
-            };
-        }
+            }
+            ArchiveKind::Gzip => {}
+        };
 
         // If it's not an archive, check the YARA rules.
         let yara_result = match scan_file_yara_from_disk(path, yara_scanner) {
@@ -335,27 +382,58 @@ fn scan_directory(
     }
 }
 
-/// Function to check if a file looks like an archive. We do this by checking the file extension
-/// and magic bytes.
-fn looks_like_zip_file(path: &Path) -> Result<bool, std::io::Error> {
-    let extension_hint = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("zip"))
-        .unwrap_or(false);
+/// Function to detect the type of archive a file is.
+fn detect_archive_kind(
+    buffer: &[u8],
+    path: &std::path::Path,
+) -> Result<ArchiveKind, std::io::Error> {
+    if is_zip(buffer) {
+        return Ok(ArchiveKind::Zip);
+    }
 
-    let mut file = std::fs::File::open(path)?;
+    if is_gzip(buffer) {
+        return Ok(ArchiveKind::Gzip);
+    }
 
-    let mut magic_bytes = [0_u8; 4];
-    let file_bytes = file.read(&mut magic_bytes)?;
+    if is_tar(buffer) {
+        return Ok(ArchiveKind::Tar);
+    }
 
-    let magic_hint = file_bytes == 4 && looks_like_zip_magic_bytes(&magic_bytes);
-    Ok(extension_hint || magic_hint)
+    // Optional fallback: extension only when magic is unavailable or ambiguous.
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        match ext.to_ascii_lowercase().as_str() {
+            "tar" => return Ok(ArchiveKind::Tar),
+            "gz" => return Ok(ArchiveKind::Gzip),
+            "tgz" => return Ok(ArchiveKind::Gzip),
+            "zip" => return Ok(ArchiveKind::Zip),
+            _ => {}
+        }
+    }
+
+    Ok(ArchiveKind::Unknown)
 }
 
 /// Function to check if a set of magic bytes looks like a zip file.
-fn looks_like_zip_magic_bytes(buffer: &[u8; 4]) -> bool {
-    matches!(buffer, b"PK\x03\x04" | b"PK\x05\x06" | b"PK\x07\x08")
+fn is_zip(buffer: &[u8]) -> bool {
+    buffer.starts_with(b"PK\x03\x04")
+        || buffer.starts_with(b"PK\x05\x06")
+        || buffer.starts_with(b"PK\x07\x08")
+}
+
+/// Function to check if a set of magic bytes looks like a gzip file.
+fn is_gzip(buffer: &[u8]) -> bool {
+    buffer.starts_with(&[0x1f, 0x8b])
+}
+
+/// Function to check if a set of magic bytes looks like a tar file.
+fn is_tar(buffer: &[u8]) -> bool {
+    if buffer.len() < 512 {
+        return false;
+    }
+
+    let magic = &buffer[257..263];
+
+    magic == b"ustar\0" || magic == b"ustar "
 }
 
 fn scan_zip_file(
@@ -423,7 +501,7 @@ fn scan_zip_file(
             }
         };
 
-        let virtual_path = format!("{}!/{}", path.display(), entry.name());
+        let virtual_path = make_archive_path(path, Path::new(entry.name()));
         let _ = scan_bytes(
             &virtual_path,
             &entry_buffer,
@@ -444,7 +522,7 @@ fn scan_zip_file(
 }
 
 fn scan_virtual_zip_file(
-    path: &str,
+    path: &Path,
     bytes: &[u8],
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
@@ -454,7 +532,11 @@ fn scan_virtual_zip_file(
     if depth > MAX_ALLOWED_RECURSION {
         summary.files_skipped += 1;
         summary.files_scanned_max_recursion += 1;
-        return Err("Maximum recursion reached in archive".to_string());
+        eprintln!(
+            "Skipped file: Maximum recursion reached in archive: {}",
+            path.display()
+        );
+        return Ok(());
     }
     summary.archives_scanned += 1;
     let cursor = Cursor::new(bytes);
@@ -509,7 +591,7 @@ fn scan_virtual_zip_file(
             }
         };
 
-        let virtual_path = format!("{}!/{}", path, entry.name());
+        let virtual_path = make_archive_path(path, Path::new(entry.name()));
         let _ = scan_bytes(
             &virtual_path,
             &entry_buffer,
@@ -527,6 +609,14 @@ fn scan_virtual_zip_file(
     }
 
     Ok(())
+}
+
+/// Function to create safe(ish) virtual paths for archived files.
+fn make_archive_path(archive_path: &Path, entry_path: &Path) -> PathBuf {
+    let mut display = archive_path.to_string_lossy().to_string();
+    display.push_str("!/");
+    display.push_str(&entry_path.to_string_lossy());
+    PathBuf::from(display)
 }
 
 /// Function to read a limited number of bytes from a reader into a buffer.
@@ -554,7 +644,7 @@ fn read_limited_into<R: Read>(
 
 /// Function to scan a file held in memory, and not on disk.
 fn scan_bytes(
-    virtual_path: &str,
+    virtual_path: &Path,
     bytes: &[u8],
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
@@ -575,7 +665,7 @@ fn scan_bytes(
         Ok(result) => result,
         Err(err) => {
             summary.errors += 1;
-            eprintln!("Could not scan {}: {}", virtual_path, err);
+            eprintln!("Could not scan {}: {}", virtual_path.display(), err);
             return Err(err);
         }
     };
@@ -593,28 +683,49 @@ fn scan_bytes(
 
     // Run heavier rules scan
     if bytes.len() > 32 {
-        // Check if file looks like a zip archive.
-        let magic_bytes: &[u8; 4] = bytes
-            .get(..4)
-            .and_then(|s| s.try_into().ok())
-            .expect("slice is known to be at least 4 bytes");
-        if looks_like_zip_magic_bytes(magic_bytes) {
-            let _ = scan_virtual_zip_file(
-                virtual_path,
-                bytes,
-                hash_database,
-                yara_scanner,
-                summary,
-                depth,
-            );
-        }
+        // Check if we're attempting to scan an archive.
+        let archive_kind = match detect_archive_kind(bytes, virtual_path) {
+            Ok(kind) => kind,
+            Err(err) => {
+                summary.errors += 1;
+                eprintln!(
+                    "Could not determine if {} is an archive: {}",
+                    virtual_path.display(),
+                    err
+                );
+                return Err(err.to_string());
+            }
+        };
+
+        match archive_kind {
+            ArchiveKind::Unknown => {}
+            ArchiveKind::Zip => {
+                summary.archives_scanned += 1;
+                match scan_virtual_zip_file(
+                    virtual_path,
+                    bytes,
+                    hash_database,
+                    yara_scanner,
+                    summary,
+                    depth,
+                ) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        summary.errors += 1;
+                        eprintln!("Could not scan {}: {}", virtual_path.display(), err);
+                    }
+                };
+            }
+            ArchiveKind::Tar => {}
+            ArchiveKind::Gzip => {}
+        };
 
         // Compare the file to YARA rules.
         let yara_result = match scan_file_yara_from_memory(bytes, yara_scanner) {
             Ok(result) => result,
             Err(err) => {
                 summary.errors += 1;
-                eprintln!("Could not scan {}: {}", virtual_path, err);
+                eprintln!("Could not scan {}: {}", virtual_path.display(), err);
                 return Err(err);
             }
         };
@@ -656,6 +767,60 @@ fn scan_bytes(
             });
         }
     };
+
+    Ok(())
+}
+
+/// Function to scan a tar file on disk.
+fn scan_tar_file(
+    path: &Path,
+    hash_database: &HashDatabase,
+    yara_scanner: &mut yara_x::Scanner,
+    summary: &mut ScanSummaryStats,
+) -> Result<(), std::io::Error> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = tar::Archive::new(file);
+
+    for entry_result in archive.entries()? {
+        let mut entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                summary.errors += 1;
+                eprintln!("Could not read tar entry in {:?}: {}", path, err);
+                continue;
+            }
+        };
+
+        let header = entry.header();
+
+        if !header.entry_type().is_file() {
+            summary.skipped_unsupported_archive_entries += 1;
+            continue;
+        }
+
+        let entry_path = match entry.path() {
+            Ok(path) => path.into_owned(),
+            Err(err) => {
+                summary.errors += 1;
+                eprintln!("Could not read tar entry path in {:?}: {}", path, err);
+                continue;
+            }
+        };
+
+        let virtual_path = make_archive_path(path, &entry_path);
+
+        let mut contents = Vec::new();
+        entry.read_to_end(&mut contents)?;
+
+        let _ = scan_bytes(
+            &virtual_path,
+            &contents,
+            hash_database,
+            yara_scanner,
+            summary,
+            1,
+        );
+    }
 
     Ok(())
 }
