@@ -119,7 +119,7 @@ fn classify_yara_rule<'a>(
         // Metadata keys alone are usually less useful than values,
         // but this lets you handle fields like "malware", "family", etc.
         saw_credential |= contains_class_hint(key, &["credential", "stealer"]);
-        saw_eicar |= contains_class_hint(key, &["description", "EICAR"]);
+        saw_eicar |= contains_class_hint(key, &["EICAR"]);
     }
 
     if saw_credential {
