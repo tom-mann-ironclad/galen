@@ -52,7 +52,7 @@ fn main() {
             println!("Scanned {} files", summary.files_scanned);
             println!("Skipped {} files", summary.files_skipped);
             println!(
-                "  potential zip bomb {}",
+                "  potential archive bomb {}",
                 summary.files_scanned_too_large_when_uncompressed
                     + summary.files_scanned_max_recursion
             );
@@ -89,6 +89,7 @@ fn main() {
 
             println!("----------- SCAN SUMMARY -----------");
             println!("Scanned files: {}", summary.files_scanned);
+            println!("Scanned archives: {}", summary.archives_scanned);
             println!("Infected Files: {}", threats_detected);
             println!("Time: {:?}", scan_time);
 

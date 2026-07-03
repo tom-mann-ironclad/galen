@@ -942,6 +942,7 @@ name = "galen"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flate2",
  "rusqlite",
  "serde",
  "serde_json",

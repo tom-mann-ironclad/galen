@@ -283,7 +283,16 @@ fn scan_one_and_report(
                     }
                 }
             }
-            ArchiveKind::Gzip => {}
+            ArchiveKind::Gzip => {
+                summary.archives_scanned += 1;
+                match scan_gzip_file(path, hash_database, yara_scanner, summary) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        summary.errors += 1;
+                        eprintln!("Could not scan {}: {}", path.display(), err);
+                    }
+                }
+            }
         };
 
         // If it's not an archive, check the YARA rules.
@@ -823,4 +832,271 @@ fn scan_tar_file(
     }
 
     Ok(())
+}
+
+/// Function to scan a tar file on disk.
+fn scan_virtual_tar_file(
+    path: &Path,
+    bytes: &[u8],
+    hash_database: &HashDatabase,
+    yara_scanner: &mut yara_x::Scanner,
+    summary: &mut ScanSummaryStats,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_ALLOWED_RECURSION {
+        summary.files_skipped += 1;
+        summary.files_scanned_max_recursion += 1;
+        eprintln!(
+            "Skipped file: Maximum recursion reached in archive: {}",
+            path.display()
+        );
+        return Ok(());
+    }
+    summary.archives_scanned += 1;
+    let cursor = Cursor::new(bytes);
+
+    let mut archive = tar::Archive::new(cursor);
+
+    for entry_result in match archive.entries() {
+        Ok(entries) => entries,
+        Err(err) => {
+            summary.errors += 1;
+            eprintln!("Could not read tar entries in {:?}: {}", path, err);
+            return Ok(());
+        }
+    } {
+        let mut entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                summary.errors += 1;
+                eprintln!("Could not read tar entry in {:?}: {}", path, err);
+                continue;
+            }
+        };
+
+        let header = entry.header();
+
+        if !header.entry_type().is_file() {
+            summary.skipped_unsupported_archive_entries += 1;
+            continue;
+        }
+
+        let entry_path = match entry.path() {
+            Ok(path) => path.into_owned(),
+            Err(err) => {
+                summary.errors += 1;
+                eprintln!("Could not read tar entry path in {:?}: {}", path, err);
+                continue;
+            }
+        };
+
+        let virtual_path = make_archive_path(path, &entry_path);
+
+        let mut contents = Vec::new();
+        match entry.read_to_end(&mut contents) {
+            Ok(_) => {}
+            Err(err) => {
+                summary.errors += 1;
+                eprintln!("Could not read tar entry path in {:?}: {}", path, err);
+                continue;
+            }
+        };
+
+        let _ = scan_bytes(
+            &virtual_path,
+            &contents,
+            hash_database,
+            yara_scanner,
+            summary,
+            1,
+        );
+    }
+
+    Ok(())
+}
+
+fn scan_gzip_file(
+    path: &Path,
+    hash_database: &HashDatabase,
+    yara_scanner: &mut yara_x::Scanner,
+    summary: &mut ScanSummaryStats,
+) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|err| err.to_string())?;
+    let decompressed = match decompress_gzip_limited(file, MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            summary.files_skipped += 1;
+            summary.files_scanned_too_large_when_uncompressed += 1;
+            eprintln!(
+                "Skipped file: gzip decompression limit reached: {} ({})",
+                path.display(),
+                err
+            );
+            return Ok(());
+        }
+    };
+
+    if decompressed.is_empty() {
+        summary.files_skipped += 1;
+        summary.files_skipped_zero_size += 1;
+        return Ok(());
+    }
+
+    let inner_path = gzip_inner_virtual_path(path);
+
+    let inner_kind = match detect_archive_kind(&decompressed, &inner_path) {
+        Ok(kind) => kind,
+        Err(_err) => {
+            summary.errors += 1;
+            return Ok(());
+        }
+    };
+
+    match inner_kind {
+        ArchiveKind::Tar => {
+            scan_virtual_tar_file(path, &decompressed, hash_database, yara_scanner, summary, 1)
+        }
+
+        ArchiveKind::Zip => scan_virtual_zip_file(
+            &inner_path,
+            &decompressed,
+            hash_database,
+            yara_scanner,
+            summary,
+            1,
+        ),
+
+        ArchiveKind::Gzip => scan_virtual_gzip_file(
+            &inner_path,
+            &decompressed,
+            hash_database,
+            yara_scanner,
+            summary,
+            1,
+        ),
+
+        ArchiveKind::Unknown => scan_bytes(
+            &inner_path,
+            &decompressed,
+            hash_database,
+            yara_scanner,
+            summary,
+            0,
+        ),
+    }
+}
+
+fn scan_virtual_gzip_file(
+    path: &Path,
+    bytes: &[u8],
+    hash_database: &HashDatabase,
+    yara_scanner: &mut yara_x::Scanner,
+    summary: &mut ScanSummaryStats,
+    depth: usize,
+) -> Result<(), String> {
+    let decompressed = match decompress_gzip_limited(bytes, MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            summary.files_skipped += 1;
+            summary.files_scanned_too_large_when_uncompressed += 1;
+            eprintln!(
+                "Skipped file: gzip decompression limit reached: {} ({})",
+                path.display(),
+                err
+            );
+            return Ok(());
+        }
+    };
+
+    if decompressed.is_empty() {
+        summary.files_skipped += 1;
+        summary.files_skipped_zero_size += 1;
+        return Ok(());
+    }
+
+    let inner_path = gzip_inner_virtual_path(path);
+
+    let inner_kind = match detect_archive_kind(&decompressed, &inner_path) {
+        Ok(kind) => kind,
+        Err(_err) => {
+            summary.errors += 1;
+            return Ok(());
+        }
+    };
+
+    match inner_kind {
+        ArchiveKind::Tar => scan_virtual_tar_file(
+            path,
+            &decompressed,
+            hash_database,
+            yara_scanner,
+            summary,
+            depth + 1,
+        ),
+
+        ArchiveKind::Zip => scan_virtual_zip_file(
+            &inner_path,
+            &decompressed,
+            hash_database,
+            yara_scanner,
+            summary,
+            depth + 1,
+        ),
+
+        ArchiveKind::Gzip => scan_virtual_gzip_file(
+            &inner_path,
+            &decompressed,
+            hash_database,
+            yara_scanner,
+            summary,
+            depth + 1,
+        ),
+
+        ArchiveKind::Unknown => scan_bytes(
+            &inner_path,
+            &decompressed,
+            hash_database,
+            yara_scanner,
+            summary,
+            depth,
+        ),
+    }
+}
+
+/// Helper function to decompress a gzip archive into a limited buffer.
+fn decompress_gzip_limited<R: Read>(
+    reader: R,
+    max_decompressed_size: u64,
+) -> Result<Vec<u8>, String> {
+    let mut decoder = flate2::read::GzDecoder::new(reader);
+
+    let mut limited_reader = decoder.by_ref().take(max_decompressed_size + 1);
+    let mut decompressed = Vec::new();
+
+    limited_reader
+        .read_to_end(&mut decompressed)
+        .map_err(|err| err.to_string())?;
+
+    if decompressed.len() as u64 > max_decompressed_size {
+        return Err("gzip decompressed size limit exceeded".to_string());
+    }
+
+    Ok(decompressed)
+}
+
+/// Helper function to get the virtual path inside of a gzip archive.
+fn gzip_inner_virtual_path(path: &Path) -> std::path::PathBuf {
+    let display = path.to_string_lossy();
+
+    let inner_name = if display.ends_with(".tar.gz") {
+        display.trim_end_matches(".gz").to_string()
+    } else if display.ends_with(".tgz") {
+        display.trim_end_matches(".tgz").to_string() + ".tar"
+    } else if display.ends_with(".gz") {
+        display.trim_end_matches(".gz").to_string()
+    } else {
+        "<decompressed>".to_string()
+    };
+
+    std::path::PathBuf::from(format!("{}!/{}", display, inner_name))
 }
