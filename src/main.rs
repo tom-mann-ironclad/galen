@@ -44,10 +44,14 @@ fn main() {
             eprintln!("{:?} rules loaded", rules.iter().len());
 
             eprintln!("Starting scan...");
+            let start_time = std::time::Instant::now();
             let summary = scan_path(&args.target, &hash_database, &mut yara_scanner);
+            let end_time = std::time::Instant::now();
+            let scan_time: std::time::Duration = end_time - start_time;
             println!();
             println!("Scanned {} files", summary.files_scanned);
             println!("Skipped {} files", summary.files_skipped);
+            println!("  potential zip bomb {}", summary.files_scanned_too_large_when_uncompressed + summary.files_scanned_max_recursion);
             println!("  zero-size {}", summary.files_skipped_zero_size);
             if summary.known_hash_detections != 0 {
                 println!("{} known hash detections", summary.known_hash_detections);
@@ -66,11 +70,11 @@ fn main() {
                 }
             }
 
-            let mut threats_detected = false;
+            let mut threats_detected = 0;
             for record in summary.detections {
                 if record.verdict >= Verdict::Suspicious {
                     println!("{:?}", record);
-                    threats_detected = true;
+                    threats_detected += 1;
                 }
             }
 
@@ -79,7 +83,12 @@ fn main() {
                 std::process::exit(2);
             }
 
-            if threats_detected {
+            println!("----------- SCAN SUMMARY -----------");
+            println!("Scanned files: {}", summary.files_scanned);
+            println!("Infected Files: {}", threats_detected);
+            println!("Time: {:?}", scan_time);
+
+            if threats_detected > 0 {
                 std::process::exit(1);
             }
 
