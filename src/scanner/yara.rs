@@ -1,5 +1,5 @@
-use std::{fs::File, io::BufReader, path::Path};
 use super::heuristics::Confidence;
+use std::{fs::File, io::BufReader, path::Path};
 use yara_x::Rules;
 
 /// Function to load a compiled YARA rules cache from disk.
@@ -14,6 +14,7 @@ pub fn load_yara_rules_cache(path: impl AsRef<Path>) -> Result<Rules, Box<dyn st
 /// Internal classifications of YARA rules.
 #[derive(Debug)]
 pub enum YaraRuleClass {
+    EICAR,
     HighConfidenceMalware,
     MalwareFamily,
     SuspiciousCapability,
@@ -46,7 +47,7 @@ pub struct MatchedYaraRule {
 }
 
 impl MatchedYaraRule {
-pub fn from_yara_rule(rule: yara_x::Rule<'_, '_>) -> Self {
+    pub fn from_yara_rule(rule: yara_x::Rule<'_, '_>) -> Self {
         let identifier = rule.identifier();
 
         let class = classify_yara_rule(
@@ -55,7 +56,8 @@ pub fn from_yara_rule(rule: yara_x::Rule<'_, '_>) -> Self {
             rule.metadata().map(|metadata| metadata.0),
         );
 
-        let strength = infer_persistence_strength(identifier, rule.tags().map(|tag| tag.identifier()));
+        let strength =
+            infer_persistence_strength(identifier, rule.tags().map(|tag| tag.identifier()));
 
         Self {
             name: identifier.to_string(),
@@ -63,8 +65,6 @@ pub fn from_yara_rule(rule: yara_x::Rule<'_, '_>) -> Self {
             strength,
         }
     }
-
-    
 }
 
 fn classify_yara_rule<'a>(
@@ -72,60 +72,54 @@ fn classify_yara_rule<'a>(
     tags: impl IntoIterator<Item = &'a str>,
     metadata_keys: impl IntoIterator<Item = &'a str>,
 ) -> YaraRuleClass {
-    let mut saw_persistence = contains_class_hint(identifier, &[
-        "ldpreload",
-        "ld_preload",
-        "systemd",
-        "cron",
-        "persistence",
-    ]);
+    let mut saw_persistence = contains_class_hint(
+        identifier,
+        &["ldpreload", "ld_preload", "systemd", "cron", "persistence"],
+    );
 
-    let mut saw_packer = contains_class_hint(identifier, &[
-        "packer",
-        "packed",
-        "upx",
-        "obfus",
-        "cryptor",
-    ]);
+    let mut saw_eicar = contains_class_hint(identifier, &["eicar", "EICAR", "Eicar"]);
 
-    let mut saw_credential = contains_class_hint(identifier, &[
-        "credential",
-        "password",
-        "keylogger",
-        "stealer",
-        "infostealer",
-    ]);
+    let mut saw_packer =
+        contains_class_hint(identifier, &["packer", "packed", "upx", "obfus", "cryptor"]);
 
-    for tag in tags {
-        saw_persistence |= contains_class_hint(tag, &[
-            "ldpreload",
-            "ld_preload",
-            "systemd",
-            "cron",
-            "persistence",
-        ]);
-
-        saw_packer |= contains_class_hint(tag, &[
-            "packer",
-            "packed",
-            "upx",
-            "obfus",
-            "cryptor",
-        ]);
-
-        saw_credential |= contains_class_hint(tag, &[
+    let mut saw_credential = contains_class_hint(
+        identifier,
+        &[
             "credential",
             "password",
             "keylogger",
             "stealer",
             "infostealer",
-        ]);
+        ],
+    );
+
+    for tag in tags {
+        saw_persistence |= contains_class_hint(
+            tag,
+            &["ldpreload", "ld_preload", "systemd", "cron", "persistence"],
+        );
+
+        saw_eicar |= contains_class_hint(tag, &["eicar"]);
+
+        saw_packer |= contains_class_hint(tag, &["packer", "packed", "upx", "obfus", "cryptor"]);
+
+        saw_credential |= contains_class_hint(
+            tag,
+            &[
+                "credential",
+                "password",
+                "keylogger",
+                "stealer",
+                "infostealer",
+            ],
+        );
     }
 
     for key in metadata_keys {
         // Metadata keys alone are usually less useful than values,
         // but this lets you handle fields like "malware", "family", etc.
         saw_credential |= contains_class_hint(key, &["credential", "stealer"]);
+        saw_eicar |= contains_class_hint(key, &["description", "EICAR"]);
     }
 
     if saw_credential {
@@ -134,6 +128,8 @@ fn classify_yara_rule<'a>(
         YaraRuleClass::Persistence
     } else if saw_packer {
         YaraRuleClass::PackerOrObfuscation
+    } else if saw_eicar {
+        YaraRuleClass::EICAR
     } else {
         YaraRuleClass::Unknown
     }
@@ -152,6 +148,7 @@ fn infer_persistence_strength<'a>(
     let mut saw_cron = false;
     let mut saw_systemd = false;
     let mut saw_shell_startup = false;
+    let mut saw_eicar = false;
 
     for value in std::iter::once(identifier).chain(tags) {
         let v = value.to_ascii_lowercase();
@@ -159,7 +156,9 @@ fn infer_persistence_strength<'a>(
         saw_ld_preload |= v.contains("ldpreload") || v.contains("ld_preload");
         saw_cron |= v.contains("cron") || v.contains("crontab");
         saw_systemd |= v.contains("systemd") || v.contains("systemctl") || v.contains("service");
-        saw_shell_startup |= v.contains("bashrc") || v.contains("profile") || v.contains("autostart");
+        saw_shell_startup |=
+            v.contains("bashrc") || v.contains("profile") || v.contains("autostart");
+        saw_eicar |= v.contains("eicar");
     }
 
     let hits = [
@@ -167,6 +166,7 @@ fn infer_persistence_strength<'a>(
         saw_cron,
         saw_systemd,
         saw_shell_startup,
+        saw_eicar,
     ]
     .into_iter()
     .filter(|seen| *seen)
@@ -178,33 +178,25 @@ fn infer_persistence_strength<'a>(
     }
 }
 
-pub fn score_matched_rule(
-    class: &YaraRuleClass,
-    strength: &RuleStrength,
-) -> (u16, Confidence) {
+pub fn score_matched_rule(class: &YaraRuleClass, strength: &RuleStrength) -> (u16, Confidence) {
     match (class, strength) {
+        (YaraRuleClass::EICAR, _) => (100, Confidence::High),
         (_, RuleStrength::HighConfidenceMalware) => (75, Confidence::High),
         (_, RuleStrength::MalwareSpecific) => (60, Confidence::High),
 
-        (YaraRuleClass::Persistence, RuleStrength::ConcreteTechnique) => {
-            (35, Confidence::Medium)
-        }
+        (YaraRuleClass::Persistence, RuleStrength::ConcreteTechnique) => (35, Confidence::Medium),
 
         (YaraRuleClass::Persistence, RuleStrength::CombinedSuspiciousPrimitives) => {
             (20, Confidence::Low)
         }
 
-        (YaraRuleClass::Persistence, RuleStrength::GenericPrimitive) => {
-            (10, Confidence::Low)
-        }
+        (YaraRuleClass::Persistence, RuleStrength::GenericPrimitive) => (10, Confidence::Low),
 
         (YaraRuleClass::CredentialAccess, RuleStrength::ConcreteTechnique) => {
             (45, Confidence::Medium)
         }
 
-        (YaraRuleClass::CredentialAccess, RuleStrength::GenericPrimitive) => {
-            (15, Confidence::Low)
-        }
+        (YaraRuleClass::CredentialAccess, RuleStrength::GenericPrimitive) => (15, Confidence::Low),
 
         (YaraRuleClass::PackerOrObfuscation, RuleStrength::GenericPrimitive) => {
             (5, Confidence::Low)
@@ -214,4 +206,3 @@ pub fn score_matched_rule(
         _ => (10, Confidence::Low),
     }
 }
-

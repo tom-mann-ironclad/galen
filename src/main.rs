@@ -2,7 +2,9 @@ pub mod cli;
 pub mod scanner;
 pub mod updater;
 
-use crate::scanner::{database::load_hash_database, scan::scan_path, yara::load_yara_rules_cache, heuristics::Verdict};
+use crate::scanner::{
+    database::load_hash_database, heuristics::Verdict, scan::scan_path, yara::load_yara_rules_cache,
+};
 use crate::updater::{
     update_signatures::update_signatures_using_malware_bazaar, update_yara_rules::update_yara_rules,
 };

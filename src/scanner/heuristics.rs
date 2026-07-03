@@ -70,11 +70,11 @@ impl HeuristicAccumulator {
 
     pub fn verdict(&self) -> Verdict {
         match self.score {
-        0 => Verdict::Clean,
-        1..=29 => Verdict::Informational,
-        30..=59 => Verdict::Suspicious,
-        60..=89 => Verdict::LikelyMalicious,
-        _ => Verdict::Malicious,
+            0 => Verdict::Clean,
+            1..=29 => Verdict::Informational,
+            30..=59 => Verdict::Suspicious,
+            60..=89 => Verdict::LikelyMalicious,
+            _ => Verdict::Malicious,
+        }
     }
-}
 }
