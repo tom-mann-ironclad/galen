@@ -20,7 +20,8 @@ const MAX_ALLOWED_RECURSION: usize = 5;
 #[derive(Debug, Default)]
 /// The stats from scanning a given file/directory path.
 pub struct ScanSummaryStats {
-    pub files_scanned: u64,
+    pub filesystem_files_scanned: u64,
+    pub archive_entries_scanned: u64,
     pub archives_scanned: u64,
     pub known_hash_detections: u64,
     pub yara_detections: u64,
@@ -46,6 +47,11 @@ impl ScanSummaryStats {
     /// Function to count the number of skips for a given reason.
     pub fn skip_count(&self, reason: SkipReason) -> usize {
         self.files_skipped_by_reason[reason.as_index()]
+    }
+
+    /// Function to count the total number of files scanned.
+    pub fn total_files_scanned(&self) -> u64 {
+        self.filesystem_files_scanned + self.archive_entries_scanned
     }
 }
 
@@ -108,11 +114,49 @@ impl SkipReason {
 }
 
 #[derive(Debug)]
+pub enum DetectionSurface {
+    FileSystemFile,
+    ArchiveContainer,
+    ArchiveEntry,
+}
+
+impl DetectionSurface {
+    pub const COUNT: usize = 3;
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DetectionSurface::FileSystemFile => "filesystem file",
+            DetectionSurface::ArchiveEntry => "archive entry",
+            DetectionSurface::ArchiveContainer => "archive container",
+        }
+    }
+
+    pub const ALL: [DetectionSurface; Self::COUNT] = [
+        DetectionSurface::FileSystemFile,
+        DetectionSurface::ArchiveEntry,
+        DetectionSurface::ArchiveContainer,
+    ];
+}
+
+#[derive(Debug)]
 pub struct DetectionRecord {
     pub path: PathBuf,
     pub score: u16,
     pub verdict: Verdict,
     pub findings: [Option<Finding>; MAX_FINDINGS_PER_FILE],
+    pub surface: DetectionSurface,
+}
+
+impl DetectionRecord {
+    /// Function to tell if a detection recorded is from an archive.
+    pub fn is_archive_path(&self) -> bool {
+        self.path.to_string_lossy().contains("!/")
+    }
+
+    /// Function to tell if a detection recorded is from a file system file.
+    pub fn is_filesystem_path(&self) -> bool {
+        !self.is_archive_path()
+    }
 }
 
 /// The result of scanning a single file to compare it's hash.
@@ -251,6 +295,7 @@ fn scan_one_and_report(
     summary: &mut ScanSummaryStats,
 ) {
     let mut heuristics = HeuristicAccumulator::new();
+    let mut surface = DetectionSurface::FileSystemFile;
     let metadata = match path.metadata() {
         Ok(metadata) => metadata,
         Err(err) => {
@@ -328,6 +373,11 @@ fn scan_one_and_report(
             }
         };
 
+        surface = match archive_kind {
+            ArchiveKind::Unknown => DetectionSurface::FileSystemFile,
+            _ => DetectionSurface::ArchiveContainer,
+        };
+
         // Important: the probe read advanced the file cursor.
         // Archive readers must start from byte 0.
         if let Err(err) = file.seek(SeekFrom::Start(0)) {
@@ -392,7 +442,7 @@ fn scan_one_and_report(
     }
 
     // Summarise scan and report
-    summary.files_scanned += 1;
+    summary.filesystem_files_scanned += 1;
     let verdict = heuristics.verdict();
     match verdict {
         Verdict::Clean => {}
@@ -402,6 +452,7 @@ fn scan_one_and_report(
                 score: heuristics.score(),
                 verdict,
                 findings: heuristics.findings(),
+                surface,
             });
         }
     };
@@ -540,7 +591,6 @@ fn normalise_archive_entry_name(entry_path: &Path) -> PathBuf {
     }
 }
 
-
 /// Function to read a limited number of bytes from a reader into a buffer.
 fn read_limited_into<R: Read>(
     reader: &mut R,
@@ -574,7 +624,7 @@ fn scan_bytes(
     depth: usize,
 ) -> Result<(), String> {
     let mut heuristics = HeuristicAccumulator::new();
-
+    let mut surface = DetectionSurface::ArchiveEntry;
     // Skip files with a length of 0.
     if bytes.is_empty() {
         summary.record_skip(SkipReason::ZeroSize);
@@ -682,6 +732,11 @@ fn scan_bytes(
             }
         }
 
+        surface = match archive_kind {
+            ArchiveKind::Unknown => DetectionSurface::ArchiveEntry,
+            _ => DetectionSurface::ArchiveContainer,
+        };
+
         // Compare the file to YARA rules.
         let yara_result = match scan_file_yara_from_memory(bytes, yara_scanner) {
             Ok(result) => result,
@@ -716,7 +771,7 @@ fn scan_bytes(
     }
 
     // Summarise scan and report
-    summary.files_scanned += 1;
+    summary.archive_entries_scanned += 1;
     let verdict = heuristics.verdict();
     match verdict {
         Verdict::Clean => {}
@@ -726,6 +781,7 @@ fn scan_bytes(
                 score: heuristics.score(),
                 verdict,
                 findings: heuristics.findings(),
+                surface,
             });
         }
     };
@@ -840,7 +896,7 @@ where
     R: Read,
 {
     if depth >= MAX_ALLOWED_RECURSION {
-         summary.record_skip(SkipReason::MaxArchiveDepth);
+        summary.record_skip(SkipReason::MaxArchiveDepth);
         eprintln!(
             "Skipped archive: maximum recursion reached: {}",
             archive_path.display()
@@ -1067,28 +1123,16 @@ mod tests {
 
     #[test]
     fn archive_path_for_simple_zip_entry() {
-        let path = make_archive_path(
-            Path::new("./corpus/eicar.zip"),
-            Path::new("eicar.com"),
-        );
+        let path = make_archive_path(Path::new("./corpus/eicar.zip"), Path::new("eicar.com"));
 
-        assert_eq!(
-            path,
-            PathBuf::from("./corpus/eicar.zip!/eicar.com")
-        );
+        assert_eq!(path, PathBuf::from("./corpus/eicar.zip!/eicar.com"));
     }
 
     #[test]
     fn archive_path_strips_leading_dot_slash_from_tar_entry() {
-        let path = make_archive_path(
-            Path::new("./corpus/eicar.tar"),
-            Path::new("./eicar.com"),
-        );
+        let path = make_archive_path(Path::new("./corpus/eicar.tar"), Path::new("./eicar.com"));
 
-        assert_eq!(
-            path,
-            PathBuf::from("./corpus/eicar.tar!/eicar.com")
-        );
+        assert_eq!(path, PathBuf::from("./corpus/eicar.tar!/eicar.com"));
     }
 
     #[test]
@@ -1098,10 +1142,7 @@ mod tests {
             Path::new("inner/eicar.zip"),
         );
 
-        assert_eq!(
-            path,
-            PathBuf::from("./corpus/outer.zip!/inner/eicar.zip")
-        );
+        assert_eq!(path, PathBuf::from("./corpus/outer.zip!/inner/eicar.zip"));
     }
 
     #[test]
@@ -1111,10 +1152,7 @@ mod tests {
             Path::new("./inner/eicar.zip"),
         );
 
-        assert_eq!(
-            path,
-            PathBuf::from("./corpus/outer.tar!/inner/eicar.zip")
-        );
+        assert_eq!(path, PathBuf::from("./corpus/outer.tar!/inner/eicar.zip"));
     }
 
     #[test]
@@ -1132,67 +1170,47 @@ mod tests {
 
     #[test]
     fn gzip_inner_virtual_path_for_tar_gz_uses_basename_only() {
-        let path = gzip_inner_virtual_path(Path::new(
-            "./corpus/malicious/synthetic/eicar/eicar.tar.gz",
-        ));
+        let path =
+            gzip_inner_virtual_path(Path::new("./corpus/malicious/synthetic/eicar/eicar.tar.gz"));
 
         assert_eq!(
             path,
-            PathBuf::from(
-                "./corpus/malicious/synthetic/eicar/eicar.tar.gz!/eicar.tar"
-            )
+            PathBuf::from("./corpus/malicious/synthetic/eicar/eicar.tar.gz!/eicar.tar")
         );
     }
 
     #[test]
     fn gzip_inner_virtual_path_for_tgz_uses_tar_basename() {
-        let path = gzip_inner_virtual_path(Path::new(
-            "./corpus/archive.tgz",
-        ));
+        let path = gzip_inner_virtual_path(Path::new("./corpus/archive.tgz"));
 
-        assert_eq!(
-            path,
-            PathBuf::from("./corpus/archive.tgz!/archive.tar")
-        );
+        assert_eq!(path, PathBuf::from("./corpus/archive.tgz!/archive.tar"));
     }
 
     #[test]
     fn gzip_inner_virtual_path_for_plain_gz_strips_gz_from_basename() {
-        let path = gzip_inner_virtual_path(Path::new(
-            "./corpus/readme.txt.gz",
-        ));
+        let path = gzip_inner_virtual_path(Path::new("./corpus/readme.txt.gz"));
 
-        assert_eq!(
-            path,
-            PathBuf::from("./corpus/readme.txt.gz!/readme.txt")
-        );
+        assert_eq!(path, PathBuf::from("./corpus/readme.txt.gz!/readme.txt"));
     }
 
     #[test]
     fn gzip_inner_virtual_path_for_nested_virtual_tar_gz_uses_inner_basename_only() {
-        let path = gzip_inner_virtual_path(Path::new(
-            "./corpus/outer.zip!/inner/eicar.tar.gz",
-        ));
+        let path = gzip_inner_virtual_path(Path::new("./corpus/outer.zip!/inner/eicar.tar.gz"));
 
         assert_eq!(
             path,
-            PathBuf::from(
-                "./corpus/outer.zip!/inner/eicar.tar.gz!/eicar.tar"
-            )
+            PathBuf::from("./corpus/outer.zip!/inner/eicar.tar.gz!/eicar.tar")
         );
     }
 
     #[test]
     fn gzip_inner_virtual_path_for_generated_tar_gz_name() {
-        let path = gzip_inner_virtual_path(Path::new(
-            "./corpus/archives/malicious/eicar_tar_gz.tar.gz",
-        ));
+        let path =
+            gzip_inner_virtual_path(Path::new("./corpus/archives/malicious/eicar_tar_gz.tar.gz"));
 
         assert_eq!(
             path,
-            PathBuf::from(
-                "./corpus/archives/malicious/eicar_tar_gz.tar.gz!/eicar_tar_gz.tar"
-            )
+            PathBuf::from("./corpus/archives/malicious/eicar_tar_gz.tar.gz!/eicar_tar_gz.tar")
         );
     }
 

@@ -2,8 +2,15 @@ pub mod cli;
 pub mod scanner;
 pub mod updater;
 
+use std::path::Path;
+
 use crate::scanner::{
-    database::load_hash_database, heuristics::Verdict, scan::scan_path, yara::load_yara_rules_cache, scan::SkipReason,
+    database::load_hash_database,
+    heuristics::Verdict,
+    scan::SkipReason,
+    scan::scan_path,
+    scan::{DetectionRecord, DetectionSurface},
+    yara::load_yara_rules_cache,
 };
 use crate::updater::{
     update_signatures::update_signatures_using_malware_bazaar, update_yara_rules::update_yara_rules,
@@ -49,18 +56,6 @@ fn main() {
             let end_time = std::time::Instant::now();
             let scan_time: std::time::Duration = end_time - start_time;
             println!();
-            println!("Scanned {} files", summary.files_scanned);
-            
-            if summary.files_skipped > 0 {
-    println!("Skipped {} files", summary.files_skipped);
-
-    for reason in SkipReason::ALL {
-        let count = summary.skip_count(reason);
-        if count > 0 {
-            println!("  {} {}", reason.label(), count);
-        }
-    }
-}
             if !summary.yara_rules_triggered.is_empty() {
                 println!(
                     "{} YARA rules triggered",
@@ -75,12 +70,17 @@ fn main() {
                 }
             }
 
-            let mut threats_detected = 0;
-            for record in summary.detections {
-                if record.verdict >= Verdict::Suspicious {
-                    println!("{:?}", record);
-                    threats_detected += 1;
+            let mut visible_detection_records = Vec::new();
+            for record in &summary.detections {
+                if record.verdict >= Verdict::Suspicious
+                    && should_print_detection(record, &summary.detections)
+                {
+                    visible_detection_records.push(record);
                 }
+            }
+
+            for record in &visible_detection_records {
+                println!("{:?}", record);
             }
 
             if summary.errors > 0 {
@@ -89,12 +89,47 @@ fn main() {
             }
 
             println!("----------- SCAN SUMMARY -----------");
-            println!("Scanned files: {}", summary.files_scanned);
+            println!("Scanned {} files", summary.total_files_scanned());
+            println!("  filesystem files: {}", summary.filesystem_files_scanned);
+            println!("  archive entries: {}", summary.archive_entries_scanned);
             println!("Scanned archives: {}", summary.archives_scanned);
-            println!("Infected Files: {}", threats_detected);
-            println!("Time: {:?}", scan_time);
+            if summary.files_skipped > 0 {
+                println!("Skipped {} files", summary.files_skipped);
 
-            if threats_detected > 0 {
+                for reason in SkipReason::ALL {
+                    let count = summary.skip_count(reason);
+                    if count > 0 {
+                        println!("  {}: {}", reason.label(), count);
+                    }
+                }
+            }
+
+            let filesystem_path_detections = visible_detection_records
+                .iter()
+                .filter(|record| record.is_filesystem_path())
+                .count();
+
+            let archive_path_detections = visible_detection_records
+                .iter()
+                .filter(|record| record.is_archive_path())
+                .count();
+
+            println!("Detection records: {}", visible_detection_records.len());
+            if !summary.detections.is_empty() {
+                println!(
+                    "  {}: {}",
+                    DetectionSurface::FileSystemFile.label(),
+                    filesystem_path_detections
+                );
+                println!(
+                    "  {}: {}",
+                    DetectionSurface::ArchiveEntry.label(),
+                    archive_path_detections
+                );
+            }
+            println!("Scan time: {:?}", scan_time);
+
+            if !visible_detection_records.is_empty() {
                 std::process::exit(1);
             }
 
@@ -161,4 +196,22 @@ Options:
   -h, --help              Show this help text
 "
     );
+}
+
+/// Helper function to determine if a path has any child detection records.
+fn has_child_detection(container: &Path, records: &[DetectionRecord]) -> bool {
+    let prefix = format!("{}!/", container.to_string_lossy());
+
+    records
+        .iter()
+        .any(|record| record.path.to_string_lossy().starts_with(&prefix))
+}
+
+/// Function to determine which detection records should be displayed.
+fn should_print_detection(record: &DetectionRecord, records: &[DetectionRecord]) -> bool {
+    match record.surface {
+        DetectionSurface::FileSystemFile => true,
+        DetectionSurface::ArchiveEntry => true,
+        DetectionSurface::ArchiveContainer => !has_child_detection(&record.path, records),
+    }
 }
