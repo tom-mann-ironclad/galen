@@ -7,12 +7,15 @@ use super::{
     hash::{FileHashes, hash_file_from_disk, hash_file_from_memory},
 };
 use std::collections::HashMap;
-use std::io::{BufReader, Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE: u64 = 64 * 1024 * 1024;
 const RETAINED_ENTRY_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
-const MAX_ALLOWED_RECURSION: usize = 2;
+// depth 0 = top-level archive
+// depth 1 = archive inside archive
+// depth 2 = archive inside archive inside archive, rejected
+const MAX_ALLOWED_RECURSION: usize = 4;
 
 #[derive(Debug, Default)]
 /// The stats from scanning a given file/directory path.
@@ -236,8 +239,8 @@ fn scan_one_and_report(
         // ZIP needs 4 bytes.
         // GZIP needs 2 bytes.
         // TAR detection usually needs 512 bytes.
-        let mut buf = [0_u8; 512];
-        let bytes_read = match file.read(&mut buf) {
+        let mut buffer = [0_u8; 512];
+        let bytes_read = match file.read(&mut buffer) {
             Ok(bytes) => bytes,
             Err(err) => {
                 summary.errors += 1;
@@ -246,9 +249,9 @@ fn scan_one_and_report(
             }
         };
 
-        let sample = &buf[..bytes_read];
+        let sample = &buffer[..bytes_read];
 
-        let archive_kind = match detect_archive_kind(sample, path) {
+        let archive_kind = match detect_archive_kind(sample) {
             Ok(kind) => kind,
             Err(err) => {
                 summary.errors += 1;
@@ -261,38 +264,34 @@ fn scan_one_and_report(
             }
         };
 
-        match archive_kind {
-            ArchiveKind::Unknown => {}
-            ArchiveKind::Zip => {
-                summary.archives_scanned += 1;
-                match scan_zip_file(path, hash_database, yara_scanner, summary) {
-                    Ok(result) => result,
-                    Err(err) => {
-                        summary.errors += 1;
-                        eprintln!("Could not scan {}: {}", path.display(), err);
-                    }
-                };
-            }
-            ArchiveKind::Tar => {
-                summary.archives_scanned += 1;
-                match scan_tar_file(path, hash_database, yara_scanner, summary) {
-                    Ok(result) => result,
-                    Err(err) => {
-                        summary.errors += 1;
-                        eprintln!("Could not scan {}: {}", path.display(), err);
-                    }
-                }
-            }
+        // Important: the probe read advanced the file cursor.
+        // Archive readers must start from byte 0.
+        if let Err(err) = file.seek(SeekFrom::Start(0)) {
+            summary.errors += 1;
+            eprintln!(
+                "Could not rewind {} after archive probe: {}",
+                path.display(),
+                err
+            );
+            return;
+        }
+
+        if let Err(err) = match archive_kind {
+            ArchiveKind::Unknown => Ok(()),
             ArchiveKind::Gzip => {
-                summary.archives_scanned += 1;
-                match scan_gzip_file(path, hash_database, yara_scanner, summary) {
-                    Ok(result) => result,
-                    Err(err) => {
-                        summary.errors += 1;
-                        eprintln!("Could not scan {}: {}", path.display(), err);
-                    }
-                }
+                scan_gzip_reader(file, path, hash_database, yara_scanner, summary, 0)
             }
+
+            ArchiveKind::Tar => {
+                scan_tar_archive(file, path, hash_database, yara_scanner, summary, 0)
+            }
+
+            ArchiveKind::Zip => {
+                scan_zip_archive(file, path, hash_database, yara_scanner, summary, 0)
+            }
+        } {
+            summary.errors += 1;
+            eprintln!("Could not scan archive {}: {}", path.display(), err);
         };
 
         // If it's not an archive, check the YARA rules.
@@ -392,10 +391,7 @@ fn scan_directory(
 }
 
 /// Function to detect the type of archive a file is.
-fn detect_archive_kind(
-    buffer: &[u8],
-    path: &std::path::Path,
-) -> Result<ArchiveKind, std::io::Error> {
+fn detect_archive_kind(buffer: &[u8]) -> Result<ArchiveKind, std::io::Error> {
     if is_zip(buffer) {
         return Ok(ArchiveKind::Zip);
     }
@@ -406,17 +402,6 @@ fn detect_archive_kind(
 
     if is_tar(buffer) {
         return Ok(ArchiveKind::Tar);
-    }
-
-    // Optional fallback: extension only when magic is unavailable or ambiguous.
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        match ext.to_ascii_lowercase().as_str() {
-            "tar" => return Ok(ArchiveKind::Tar),
-            "gz" => return Ok(ArchiveKind::Gzip),
-            "tgz" => return Ok(ArchiveKind::Gzip),
-            "zip" => return Ok(ArchiveKind::Zip),
-            _ => {}
-        }
     }
 
     Ok(ArchiveKind::Unknown)
@@ -443,181 +428,6 @@ fn is_tar(buffer: &[u8]) -> bool {
     let magic = &buffer[257..263];
 
     magic == b"ustar\0" || magic == b"ustar "
-}
-
-fn scan_zip_file(
-    path: &Path,
-    hash_database: &HashDatabase,
-    yara_scanner: &mut yara_x::Scanner,
-    summary: &mut ScanSummaryStats,
-) -> Result<(), String> {
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) => {
-            return Err(err.to_string());
-        }
-    };
-
-    let reader = BufReader::new(file);
-
-    let mut archive = match zip::ZipArchive::new(reader) {
-        Ok(archive) => archive,
-        Err(err) => {
-            return Err(err.to_string());
-        }
-    };
-
-    let mut entry_buffer = Vec::new();
-
-    for i in 0..archive.len() {
-        let mut entry = match archive.by_index(i) {
-            Ok(entry) => entry,
-            Err(_err) => {
-                summary.errors += 1;
-                continue;
-            }
-        };
-
-        // Skip recursion for now.
-        if entry.is_dir() {
-            continue;
-        }
-
-        // We can't read encrypted files.
-        if entry.encrypted() {
-            summary.files_skipped += 1;
-            summary.files_skipped_encrypted += 1;
-            continue;
-        }
-
-        let entry_size = entry.size();
-        if entry_size > MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE {
-            summary.files_skipped += 1;
-            summary.files_scanned_too_large_when_uncompressed += 1;
-            continue;
-        }
-
-        entry_buffer.reserve(entry_size as usize);
-        match read_limited_into(
-            &mut entry,
-            &mut entry_buffer,
-            MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE,
-        ) {
-            Ok(_) => {}
-            Err(_err) => {
-                summary.files_skipped += 1;
-                // TODO: Record why
-            }
-        };
-
-        let virtual_path = make_archive_path(path, Path::new(entry.name()));
-        let _ = scan_bytes(
-            &virtual_path,
-            &entry_buffer,
-            hash_database,
-            yara_scanner,
-            summary,
-            0,
-        );
-
-        if entry_buffer.capacity() > RETAINED_ENTRY_BUFFER_LIMIT {
-            entry_buffer = Vec::new();
-        } else {
-            entry_buffer.clear();
-        }
-    }
-
-    Ok(())
-}
-
-fn scan_virtual_zip_file(
-    path: &Path,
-    bytes: &[u8],
-    hash_database: &HashDatabase,
-    yara_scanner: &mut yara_x::Scanner,
-    summary: &mut ScanSummaryStats,
-    depth: usize,
-) -> Result<(), String> {
-    if depth > MAX_ALLOWED_RECURSION {
-        summary.files_skipped += 1;
-        summary.files_scanned_max_recursion += 1;
-        eprintln!(
-            "Skipped file: Maximum recursion reached in archive: {}",
-            path.display()
-        );
-        return Ok(());
-    }
-    summary.archives_scanned += 1;
-    let cursor = Cursor::new(bytes);
-
-    let mut archive = match zip::ZipArchive::new(cursor) {
-        Ok(archive) => archive,
-        Err(err) => {
-            return Err(err.to_string());
-        }
-    };
-
-    let mut entry_buffer = Vec::new();
-
-    for i in 0..archive.len() {
-        let mut entry = match archive.by_index(i) {
-            Ok(entry) => entry,
-            Err(_err) => {
-                summary.errors += 1;
-                continue;
-            }
-        };
-
-        // Skip recursion for now.
-        if entry.is_dir() {
-            continue;
-        }
-
-        // We can't read encrypted files.
-        if entry.encrypted() {
-            summary.files_skipped += 1;
-            summary.files_skipped_encrypted += 1;
-            continue;
-        }
-
-        let entry_size = entry.size();
-        if entry_size > MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE {
-            summary.files_skipped += 1;
-            summary.files_scanned_too_large_when_uncompressed += 1;
-            continue;
-        }
-
-        entry_buffer.reserve(entry_size as usize);
-        match read_limited_into(
-            &mut entry,
-            &mut entry_buffer,
-            MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE,
-        ) {
-            Ok(_) => {}
-            Err(_err) => {
-                summary.files_skipped += 1;
-                // TODO: Record why
-            }
-        };
-
-        let virtual_path = make_archive_path(path, Path::new(entry.name()));
-        let _ = scan_bytes(
-            &virtual_path,
-            &entry_buffer,
-            hash_database,
-            yara_scanner,
-            summary,
-            depth + 1,
-        );
-
-        if entry_buffer.capacity() > RETAINED_ENTRY_BUFFER_LIMIT {
-            entry_buffer = Vec::new();
-        } else {
-            entry_buffer.clear();
-        }
-    }
-
-    Ok(())
 }
 
 /// Function to create safe(ish) virtual paths for archived files.
@@ -693,7 +503,7 @@ fn scan_bytes(
     // Run heavier rules scan
     if bytes.len() > 32 {
         // Check if we're attempting to scan an archive.
-        let archive_kind = match detect_archive_kind(bytes, virtual_path) {
+        let archive_kind = match detect_archive_kind(bytes) {
             Ok(kind) => kind,
             Err(err) => {
                 summary.errors += 1;
@@ -708,26 +518,67 @@ fn scan_bytes(
 
         match archive_kind {
             ArchiveKind::Unknown => {}
+
             ArchiveKind::Zip => {
-                summary.archives_scanned += 1;
-                match scan_virtual_zip_file(
+                let cursor = Cursor::new(bytes);
+
+                if let Err(err) = scan_zip_archive(
+                    cursor,
                     virtual_path,
-                    bytes,
                     hash_database,
                     yara_scanner,
                     summary,
                     depth,
                 ) {
-                    Ok(result) => result,
-                    Err(err) => {
-                        summary.errors += 1;
-                        eprintln!("Could not scan {}: {}", virtual_path.display(), err);
-                    }
-                };
+                    summary.errors += 1;
+                    eprintln!(
+                        "Could not scan zip archive {}: {}",
+                        virtual_path.display(),
+                        err
+                    );
+                }
             }
-            ArchiveKind::Tar => {}
-            ArchiveKind::Gzip => {}
-        };
+
+            ArchiveKind::Tar => {
+                let cursor = Cursor::new(bytes);
+
+                if let Err(err) = scan_tar_archive(
+                    cursor,
+                    virtual_path,
+                    hash_database,
+                    yara_scanner,
+                    summary,
+                    depth,
+                ) {
+                    summary.errors += 1;
+                    eprintln!(
+                        "Could not scan tar archive {}: {}",
+                        virtual_path.display(),
+                        err
+                    );
+                }
+            }
+
+            ArchiveKind::Gzip => {
+                let cursor = Cursor::new(bytes);
+
+                if let Err(err) = scan_gzip_reader(
+                    cursor,
+                    virtual_path,
+                    hash_database,
+                    yara_scanner,
+                    summary,
+                    depth,
+                ) {
+                    summary.errors += 1;
+                    eprintln!(
+                        "Could not scan gzip archive {}: {}",
+                        virtual_path.display(),
+                        err
+                    );
+                }
+            }
+        }
 
         // Compare the file to YARA rules.
         let yara_result = match scan_file_yara_from_memory(bytes, yara_scanner) {
@@ -780,96 +631,155 @@ fn scan_bytes(
     Ok(())
 }
 
-/// Function to scan a tar file on disk.
-fn scan_tar_file(
-    path: &Path,
-    hash_database: &HashDatabase,
-    yara_scanner: &mut yara_x::Scanner,
-    summary: &mut ScanSummaryStats,
-) -> Result<(), std::io::Error> {
-    let file = std::fs::File::open(path)?;
-    let mut archive = tar::Archive::new(file);
-
-    for entry_result in archive.entries()? {
-        let mut entry = match entry_result {
-            Ok(entry) => entry,
-            Err(err) => {
-                summary.errors += 1;
-                eprintln!("Could not read tar entry in {:?}: {}", path, err);
-                continue;
-            }
-        };
-
-        let header = entry.header();
-
-        if !header.entry_type().is_file() {
-            summary.skipped_unsupported_archive_entries += 1;
-            continue;
-        }
-
-        let entry_path = match entry.path() {
-            Ok(path) => path.into_owned(),
-            Err(err) => {
-                summary.errors += 1;
-                eprintln!("Could not read tar entry path in {:?}: {}", path, err);
-                continue;
-            }
-        };
-
-        let virtual_path = make_archive_path(path, &entry_path);
-
-        let mut contents = Vec::new();
-        entry.read_to_end(&mut contents)?;
-
-        let _ = scan_bytes(
-            &virtual_path,
-            &contents,
-            hash_database,
-            yara_scanner,
-            summary,
-            1,
-        );
-    }
-
-    Ok(())
-}
-
-/// Function to scan a tar file on disk.
-fn scan_virtual_tar_file(
-    path: &Path,
-    bytes: &[u8],
+/// Function to scan a zip archive.
+fn scan_zip_archive<R>(
+    reader: R,
+    archive_path: &Path,
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
     depth: usize,
-) -> Result<(), String> {
-    if depth > MAX_ALLOWED_RECURSION {
+) -> Result<(), String>
+where
+    R: Read + std::io::Seek,
+{
+    if depth >= MAX_ALLOWED_RECURSION {
         summary.files_skipped += 1;
         summary.files_scanned_max_recursion += 1;
         eprintln!(
-            "Skipped file: Maximum recursion reached in archive: {}",
-            path.display()
+            "Skipped archive: maximum recursion reached: {}",
+            archive_path.display()
         );
         return Ok(());
     }
+
     summary.archives_scanned += 1;
-    let cursor = Cursor::new(bytes);
 
-    let mut archive = tar::Archive::new(cursor);
+    let mut archive = zip::ZipArchive::new(reader).map_err(|err| err.to_string())?;
+    let mut entry_buffer = Vec::new();
 
-    for entry_result in match archive.entries() {
+    for i in 0..archive.len() {
+        let mut entry = match archive.by_index(i) {
+            Ok(entry) => entry,
+            Err(err) => {
+                summary.errors += 1;
+                eprintln!(
+                    "Could not read zip entry in {}: {}",
+                    archive_path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+
+        if entry.is_dir() {
+            continue;
+        }
+
+        if entry.encrypted() {
+            summary.files_skipped += 1;
+            summary.files_skipped_encrypted += 1;
+            continue;
+        }
+
+        let entry_size = entry.size();
+
+        if entry_size > MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE {
+            summary.files_skipped += 1;
+            summary.files_scanned_too_large_when_uncompressed += 1;
+            continue;
+        }
+
+        entry_buffer.reserve(entry_size as usize);
+
+        if let Err(err) = read_limited_into(
+            &mut entry,
+            &mut entry_buffer,
+            MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE,
+        ) {
+            summary.files_skipped += 1;
+            summary.files_scanned_too_large_when_uncompressed += 1;
+            eprintln!(
+                "Skipped zip entry: {}!/{} ({})",
+                archive_path.display(),
+                entry.name(),
+                err
+            );
+            continue;
+        }
+
+        let virtual_path = make_archive_path(archive_path, Path::new(entry.name()));
+
+        let _ = scan_bytes(
+            &virtual_path,
+            &entry_buffer,
+            hash_database,
+            yara_scanner,
+            summary,
+            depth + 1,
+        );
+
+        if entry_buffer.capacity() > RETAINED_ENTRY_BUFFER_LIMIT {
+            entry_buffer = Vec::new();
+        } else {
+            entry_buffer.clear();
+        }
+    }
+
+    Ok(())
+}
+
+/// Function to scan a tar archive.
+fn scan_tar_archive<R>(
+    reader: R,
+    archive_path: &Path,
+    hash_database: &HashDatabase,
+    yara_scanner: &mut yara_x::Scanner,
+    summary: &mut ScanSummaryStats,
+    depth: usize,
+) -> Result<(), String>
+where
+    R: Read,
+{
+    if depth >= MAX_ALLOWED_RECURSION {
+        summary.files_skipped += 1;
+        summary.files_scanned_max_recursion += 1;
+        eprintln!(
+            "Skipped archive: maximum recursion reached: {}",
+            archive_path.display()
+        );
+        return Ok(());
+    }
+
+    summary.archives_scanned += 1;
+
+    let mut archive = tar::Archive::new(reader);
+
+    let entries = match archive.entries() {
         Ok(entries) => entries,
         Err(err) => {
             summary.errors += 1;
-            eprintln!("Could not read tar entries in {:?}: {}", path, err);
+            eprintln!(
+                "Could not read tar entries in {}: {}",
+                archive_path.display(),
+                err
+            );
             return Ok(());
         }
-    } {
+    };
+
+    let mut entry_buffer = Vec::new();
+
+    for entry_result in entries {
         let mut entry = match entry_result {
             Ok(entry) => entry,
             Err(err) => {
                 summary.errors += 1;
-                eprintln!("Could not read tar entry in {:?}: {}", path, err);
+                eprintln!(
+                    "Could not read tar entry in {}: {}",
+                    archive_path.display(),
+                    err
+                );
                 continue;
             }
         };
@@ -881,127 +791,106 @@ fn scan_virtual_tar_file(
             continue;
         }
 
+        let entry_size = header.size().unwrap_or(0);
+
+        if entry_size > MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE {
+            summary.files_skipped += 1;
+            summary.files_scanned_too_large_when_uncompressed += 1;
+            continue;
+        }
+
         let entry_path = match entry.path() {
             Ok(path) => path.into_owned(),
             Err(err) => {
                 summary.errors += 1;
-                eprintln!("Could not read tar entry path in {:?}: {}", path, err);
+                eprintln!(
+                    "Could not read tar entry path in {}: {}",
+                    archive_path.display(),
+                    err
+                );
                 continue;
             }
         };
 
-        let virtual_path = make_archive_path(path, &entry_path);
+        if let Err(err) = read_limited_into(
+            &mut entry,
+            &mut entry_buffer,
+            MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE,
+        ) {
+            summary.files_skipped += 1;
+            summary.files_scanned_too_large_when_uncompressed += 1;
+            eprintln!(
+                "Skipped tar entry: {}!/{} ({})",
+                archive_path.display(),
+                entry_path.display(),
+                err
+            );
+            continue;
+        }
 
-        let mut contents = Vec::new();
-        match entry.read_to_end(&mut contents) {
-            Ok(_) => {}
-            Err(err) => {
-                summary.errors += 1;
-                eprintln!("Could not read tar entry path in {:?}: {}", path, err);
-                continue;
-            }
-        };
+        let virtual_path = make_archive_path(archive_path, &entry_path);
 
         let _ = scan_bytes(
             &virtual_path,
-            &contents,
+            &entry_buffer,
             hash_database,
             yara_scanner,
             summary,
-            1,
+            depth + 1,
         );
+
+        if entry_buffer.capacity() > RETAINED_ENTRY_BUFFER_LIMIT {
+            entry_buffer = Vec::new();
+        } else {
+            entry_buffer.clear();
+        }
     }
 
     Ok(())
 }
 
-fn scan_gzip_file(
-    path: &Path,
-    hash_database: &HashDatabase,
-    yara_scanner: &mut yara_x::Scanner,
-    summary: &mut ScanSummaryStats,
-) -> Result<(), String> {
-    let file = std::fs::File::open(path).map_err(|err| err.to_string())?;
-    let decompressed = match decompress_gzip_limited(file, MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            summary.files_skipped += 1;
-            summary.files_scanned_too_large_when_uncompressed += 1;
-            eprintln!(
-                "Skipped file: gzip decompression limit reached: {} ({})",
-                path.display(),
-                err
-            );
-            return Ok(());
-        }
-    };
-
-    if decompressed.is_empty() {
-        summary.files_skipped += 1;
-        summary.files_skipped_zero_size += 1;
-        return Ok(());
-    }
-
-    let inner_path = gzip_inner_virtual_path(path);
-
-    let inner_kind = match detect_archive_kind(&decompressed, &inner_path) {
-        Ok(kind) => kind,
-        Err(_err) => {
-            summary.errors += 1;
-            return Ok(());
-        }
-    };
-
-    match inner_kind {
-        ArchiveKind::Tar => {
-            scan_virtual_tar_file(path, &decompressed, hash_database, yara_scanner, summary, 1)
-        }
-
-        ArchiveKind::Zip => scan_virtual_zip_file(
-            &inner_path,
-            &decompressed,
-            hash_database,
-            yara_scanner,
-            summary,
-            1,
-        ),
-
-        ArchiveKind::Gzip => scan_virtual_gzip_file(
-            &inner_path,
-            &decompressed,
-            hash_database,
-            yara_scanner,
-            summary,
-            1,
-        ),
-
-        ArchiveKind::Unknown => scan_bytes(
-            &inner_path,
-            &decompressed,
-            hash_database,
-            yara_scanner,
-            summary,
-            0,
-        ),
-    }
-}
-
-fn scan_virtual_gzip_file(
-    path: &Path,
-    bytes: &[u8],
+/// Function to read gzip compressed files.
+fn scan_gzip_reader<R>(
+    reader: R,
+    archive_path: &Path,
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
     depth: usize,
-) -> Result<(), String> {
-    let decompressed = match decompress_gzip_limited(bytes, MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE) {
+) -> Result<(), String>
+where
+    R: Read,
+{
+    if depth >= MAX_ALLOWED_RECURSION {
+        summary.files_skipped += 1;
+        summary.files_scanned_max_recursion += 1;
+        eprintln!(
+            "Skipped archive: maximum recursion reached: {}",
+            archive_path.display()
+        );
+        return Ok(());
+    }
+
+    summary.archives_scanned += 1;
+
+    let decompressed = match decompress_gzip_limited(reader, MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE) {
         Ok(bytes) => bytes,
-        Err(err) => {
+        Err(err) if err.contains("size limit exceeded") => {
             summary.files_skipped += 1;
             summary.files_scanned_too_large_when_uncompressed += 1;
             eprintln!(
-                "Skipped file: gzip decompression limit reached: {} ({})",
-                path.display(),
+                "Skipped gzip archive: decompression limit reached: {} ({})",
+                archive_path.display(),
+                err
+            );
+            return Ok(());
+        }
+
+        Err(err) => {
+            summary.errors += 1;
+            eprintln!(
+                "Could not decompress gzip archive: {} ({})",
+                archive_path.display(),
                 err
             );
             return Ok(());
@@ -1014,53 +903,16 @@ fn scan_virtual_gzip_file(
         return Ok(());
     }
 
-    let inner_path = gzip_inner_virtual_path(path);
+    let inner_path = gzip_inner_virtual_path(archive_path);
 
-    let inner_kind = match detect_archive_kind(&decompressed, &inner_path) {
-        Ok(kind) => kind,
-        Err(_err) => {
-            summary.errors += 1;
-            return Ok(());
-        }
-    };
-
-    match inner_kind {
-        ArchiveKind::Tar => scan_virtual_tar_file(
-            path,
-            &decompressed,
-            hash_database,
-            yara_scanner,
-            summary,
-            depth + 1,
-        ),
-
-        ArchiveKind::Zip => scan_virtual_zip_file(
-            &inner_path,
-            &decompressed,
-            hash_database,
-            yara_scanner,
-            summary,
-            depth + 1,
-        ),
-
-        ArchiveKind::Gzip => scan_virtual_gzip_file(
-            &inner_path,
-            &decompressed,
-            hash_database,
-            yara_scanner,
-            summary,
-            depth + 1,
-        ),
-
-        ArchiveKind::Unknown => scan_bytes(
-            &inner_path,
-            &decompressed,
-            hash_database,
-            yara_scanner,
-            summary,
-            depth,
-        ),
-    }
+    scan_bytes(
+        &inner_path,
+        &decompressed,
+        hash_database,
+        yara_scanner,
+        summary,
+        depth + 1,
+    )
 }
 
 /// Helper function to decompress a gzip archive into a limited buffer.
