@@ -159,6 +159,33 @@ impl DetectionRecord {
     }
 }
 
+impl std::fmt::Display for DetectionRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "[{}] {}", self.verdict.label(), self.path.display())?;
+
+        writeln!(f, "  score: {}", self.score)?;
+
+        let mut findings_written = false;
+
+        for finding in self.findings.iter().flatten() {
+            if !findings_written {
+                writeln!(f, "  findings:")?;
+                findings_written = true;
+            }
+
+            writeln!(
+                f,
+                "    - {} (score {}, confidence {})",
+                finding.id.label(),
+                finding.score,
+                finding.confidence.label()
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
 /// The result of scanning a single file to compare it's hash.
 #[derive(Debug)]
 enum HashScanResult {

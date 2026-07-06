@@ -9,11 +9,33 @@ pub enum Verdict {
     Malicious,
 }
 
+impl Verdict {
+    pub fn label(&self) -> &str {
+        match self {
+            Verdict::Clean => "clean",
+            Verdict::Informational => "informational",
+            Verdict::Suspicious => "suspicious",
+            Verdict::LikelyMalicious => "likely malicious",
+            Verdict::Malicious => "malicious",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confidence {
     Low,
     Medium,
     High,
+}
+
+impl Confidence {
+    pub fn label(&self) -> &str {
+        match self {
+            Confidence::Low => "low",
+            Confidence::Medium => "medium",
+            Confidence::High => "high",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +49,22 @@ pub enum FindingId {
     StaticLdPreloadReference,
     ElfWritableExecutableSegment,
     RuntimeMemfdExec,
+}
+
+impl FindingId {
+    pub fn label(&self) -> &str {
+        match self {
+            FindingId::KnownHash => "known hash",
+            FindingId::SingleYaraRule => "single YARA rule match",
+            FindingId::MultipleYaraRules => "multiple YARA rule match",
+            FindingId::YaraPersistenceIndicator => "persistence indicator",
+            FindingId::YaraRootkitIndicator => "rootkit indicator",
+            FindingId::YaraPackerIndicator => "packer indicator",
+            FindingId::StaticLdPreloadReference => "static LRD preload reference",
+            FindingId::ElfWritableExecutableSegment => "writable executable segement",
+            FindingId::RuntimeMemfdExec => "runtime memfd exec",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

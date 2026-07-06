@@ -58,7 +58,7 @@ fn main() {
             println!();
             if !summary.yara_rules_triggered.is_empty() {
                 println!(
-                    "{} YARA rules triggered",
+                    "{} YARA rules triggered:",
                     summary.yara_rules_triggered.len()
                 );
 
@@ -70,6 +70,8 @@ fn main() {
                 }
             }
 
+            println!();
+            println!("Detections:");
             let mut visible_detection_records = Vec::new();
             for record in &summary.detections {
                 if record.verdict >= Verdict::Suspicious
@@ -80,7 +82,7 @@ fn main() {
             }
 
             for record in &visible_detection_records {
-                println!("{:?}", record);
+                println!("{record}");
             }
 
             if summary.errors > 0 {
