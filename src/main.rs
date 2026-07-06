@@ -3,7 +3,7 @@ pub mod scanner;
 pub mod updater;
 
 use crate::scanner::{
-    database::load_hash_database, heuristics::Verdict, scan::scan_path, yara::load_yara_rules_cache,
+    database::load_hash_database, heuristics::Verdict, scan::scan_path, yara::load_yara_rules_cache, scan::SkipReason,
 };
 use crate::updater::{
     update_signatures::update_signatures_using_malware_bazaar, update_yara_rules::update_yara_rules,
@@ -50,16 +50,17 @@ fn main() {
             let scan_time: std::time::Duration = end_time - start_time;
             println!();
             println!("Scanned {} files", summary.files_scanned);
-            println!("Skipped {} files", summary.files_skipped);
-            println!(
-                "  potential archive bomb {}",
-                summary.files_scanned_too_large_when_uncompressed
-                    + summary.files_scanned_max_recursion
-            );
-            println!("  zero-size {}", summary.files_skipped_zero_size);
-            if summary.known_hash_detections != 0 {
-                println!("{} known hash detections", summary.known_hash_detections);
-            }
+            
+            if summary.files_skipped > 0 {
+    println!("Skipped {} files", summary.files_skipped);
+
+    for reason in SkipReason::ALL {
+        let count = summary.skip_count(reason);
+        if count > 0 {
+            println!("  {} {}", reason.label(), count);
+        }
+    }
+}
             if !summary.yara_rules_triggered.is_empty() {
                 println!(
                     "{} YARA rules triggered",

@@ -8,14 +8,14 @@ use super::{
 };
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 const MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE: u64 = 64 * 1024 * 1024;
 const RETAINED_ENTRY_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
 // depth 0 = top-level archive
 // depth 1 = archive inside archive
 // depth 2 = archive inside archive inside archive, rejected
-const MAX_ALLOWED_RECURSION: usize = 4;
+const MAX_ALLOWED_RECURSION: usize = 5;
 
 #[derive(Debug, Default)]
 /// The stats from scanning a given file/directory path.
@@ -26,11 +26,7 @@ pub struct ScanSummaryStats {
     pub yara_detections: u64,
     pub errors: u64,
     pub files_skipped: u64,
-    pub files_skipped_zero_size: u64,
-    pub files_skipped_encrypted: u64,
-    pub files_scanned_too_large_when_uncompressed: u64,
-    pub files_scanned_max_recursion: u64,
-    pub skipped_unsupported_archive_entries: u64,
+    pub files_skipped_by_reason: [usize; SkipReason::COUNT],
     pub yara_rules_triggered: HashMap<String, u64>,
     pub detections: Vec<DetectionRecord>,
 }
@@ -40,6 +36,75 @@ impl ScanSummaryStats {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Function to record a skipped file, along with the reason for the skip.
+    pub fn record_skip(&mut self, reason: SkipReason) {
+        self.files_skipped += 1;
+        self.files_skipped_by_reason[reason.as_index()] += 1;
+    }
+
+    /// Function to count the number of skips for a given reason.
+    pub fn skip_count(&self, reason: SkipReason) -> usize {
+        self.files_skipped_by_reason[reason.as_index()]
+    }
+}
+
+/// The reason a file/archive was skipped during scanning.
+#[derive(Debug, Copy, Clone)]
+pub enum SkipReason {
+    ZeroSize,
+    MaxArchiveDepth,
+    MaxArchiveEntries,
+    MaxDecompressedBytes,
+    MaxCompressionRatio,
+    MalformedArchive,
+    UnsupportedArchive,
+    ArchiveReadError,
+    EncryptedFile,
+}
+
+impl SkipReason {
+    pub const COUNT: usize = 9;
+
+    pub fn as_index(self) -> usize {
+        match self {
+            SkipReason::ZeroSize => 0,
+            SkipReason::MaxArchiveDepth => 1,
+            SkipReason::MaxArchiveEntries => 2,
+            SkipReason::MaxDecompressedBytes => 3,
+            SkipReason::MaxCompressionRatio => 4,
+            SkipReason::MalformedArchive => 5,
+            SkipReason::UnsupportedArchive => 6,
+            SkipReason::ArchiveReadError => 7,
+            SkipReason::EncryptedFile => 8,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SkipReason::ZeroSize => "zero-size",
+            SkipReason::MaxArchiveDepth => "maximum recursion reached",
+            SkipReason::MaxArchiveEntries => "maximum archive entries reached",
+            SkipReason::MaxDecompressedBytes => "maximum decompressed size reached",
+            SkipReason::MaxCompressionRatio => "suspicious compression ratio",
+            SkipReason::MalformedArchive => "malformed archive",
+            SkipReason::UnsupportedArchive => "unsupported archive",
+            SkipReason::ArchiveReadError => "archive read error",
+            SkipReason::EncryptedFile => "file encrypted",
+        }
+    }
+
+    pub const ALL: [SkipReason; Self::COUNT] = [
+        SkipReason::ZeroSize,
+        SkipReason::MaxArchiveDepth,
+        SkipReason::MaxArchiveEntries,
+        SkipReason::MaxDecompressedBytes,
+        SkipReason::MaxCompressionRatio,
+        SkipReason::MalformedArchive,
+        SkipReason::UnsupportedArchive,
+        SkipReason::ArchiveReadError,
+        SkipReason::EncryptedFile,
+    ];
 }
 
 #[derive(Debug)]
@@ -197,8 +262,7 @@ fn scan_one_and_report(
 
     // Guard to avoid scanning 0-length files
     if metadata.len() == 0 {
-        summary.files_skipped += 1;
-        summary.files_skipped_zero_size += 1;
+        summary.record_skip(SkipReason::ZeroSize);
         return;
     }
 
@@ -430,13 +494,52 @@ fn is_tar(buffer: &[u8]) -> bool {
     magic == b"ustar\0" || magic == b"ustar "
 }
 
-/// Function to create safe(ish) virtual paths for archived files.
+/// Create a virtual path for archived files.
+///
+/// Example:
+///   outer.zip + dir/eicar.com -> outer.zip!/dir/eicar.com
 fn make_archive_path(archive_path: &Path, entry_path: &Path) -> PathBuf {
+    let entry_name = normalise_archive_entry_name(entry_path);
+
     let mut display = archive_path.to_string_lossy().to_string();
     display.push_str("!/");
-    display.push_str(&entry_path.to_string_lossy());
+    display.push_str(&entry_name.to_string_lossy());
+
     PathBuf::from(display)
 }
+
+/// Normalise an archive member name for virtual display paths.
+///
+/// This does not produce a filesystem extraction path.
+/// It removes root/prefix/current-dir components and ignores parent-dir components
+/// so archive entries cannot appear to escape the virtual archive namespace.
+fn normalise_archive_entry_name(entry_path: &Path) -> PathBuf {
+    let mut cleaned = PathBuf::new();
+
+    for component in entry_path.components() {
+        match component {
+            Component::Normal(part) => cleaned.push(part),
+
+            Component::CurDir => {}
+
+            Component::ParentDir => {
+                // Do not allow `..` to appear in virtual archive paths.
+                // We are not extracting, so dropping it is safer and clearer.
+            }
+
+            Component::RootDir | Component::Prefix(_) => {
+                // Avoid absolute-looking virtual paths.
+            }
+        }
+    }
+
+    if cleaned.as_os_str().is_empty() {
+        PathBuf::from("<unnamed>")
+    } else {
+        cleaned
+    }
+}
+
 
 /// Function to read a limited number of bytes from a reader into a buffer.
 fn read_limited_into<R: Read>(
@@ -474,8 +577,7 @@ fn scan_bytes(
 
     // Skip files with a length of 0.
     if bytes.is_empty() {
-        summary.files_skipped += 1;
-        summary.files_skipped_zero_size += 1;
+        summary.record_skip(SkipReason::ZeroSize);
         return Ok(());
     }
 
@@ -644,8 +746,7 @@ where
     R: Read + std::io::Seek,
 {
     if depth >= MAX_ALLOWED_RECURSION {
-        summary.files_skipped += 1;
-        summary.files_scanned_max_recursion += 1;
+        summary.record_skip(SkipReason::MaxArchiveDepth);
         eprintln!(
             "Skipped archive: maximum recursion reached: {}",
             archive_path.display()
@@ -677,16 +778,14 @@ where
         }
 
         if entry.encrypted() {
-            summary.files_skipped += 1;
-            summary.files_skipped_encrypted += 1;
+            summary.record_skip(SkipReason::EncryptedFile);
             continue;
         }
 
         let entry_size = entry.size();
 
         if entry_size > MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE {
-            summary.files_skipped += 1;
-            summary.files_scanned_too_large_when_uncompressed += 1;
+            summary.record_skip(SkipReason::MaxDecompressedBytes);
             continue;
         }
 
@@ -697,8 +796,7 @@ where
             &mut entry_buffer,
             MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE,
         ) {
-            summary.files_skipped += 1;
-            summary.files_scanned_too_large_when_uncompressed += 1;
+            summary.record_skip(SkipReason::MaxDecompressedBytes);
             eprintln!(
                 "Skipped zip entry: {}!/{} ({})",
                 archive_path.display(),
@@ -742,8 +840,7 @@ where
     R: Read,
 {
     if depth >= MAX_ALLOWED_RECURSION {
-        summary.files_skipped += 1;
-        summary.files_scanned_max_recursion += 1;
+         summary.record_skip(SkipReason::MaxArchiveDepth);
         eprintln!(
             "Skipped archive: maximum recursion reached: {}",
             archive_path.display()
@@ -786,16 +883,15 @@ where
 
         let header = entry.header();
 
-        if !header.entry_type().is_file() {
-            summary.skipped_unsupported_archive_entries += 1;
+        // Don't scan directory entries or non-file entries.
+        if header.entry_type().is_dir() || !header.entry_type().is_file() {
             continue;
         }
 
         let entry_size = header.size().unwrap_or(0);
 
         if entry_size > MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE {
-            summary.files_skipped += 1;
-            summary.files_scanned_too_large_when_uncompressed += 1;
+            summary.record_skip(SkipReason::MaxDecompressedBytes);
             continue;
         }
 
@@ -817,8 +913,7 @@ where
             &mut entry_buffer,
             MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE,
         ) {
-            summary.files_skipped += 1;
-            summary.files_scanned_too_large_when_uncompressed += 1;
+            summary.record_skip(SkipReason::MaxDecompressedBytes);
             eprintln!(
                 "Skipped tar entry: {}!/{} ({})",
                 archive_path.display(),
@@ -862,8 +957,7 @@ where
     R: Read,
 {
     if depth >= MAX_ALLOWED_RECURSION {
-        summary.files_skipped += 1;
-        summary.files_scanned_max_recursion += 1;
+        summary.record_skip(SkipReason::MaxArchiveDepth);
         eprintln!(
             "Skipped archive: maximum recursion reached: {}",
             archive_path.display()
@@ -876,8 +970,7 @@ where
     let decompressed = match decompress_gzip_limited(reader, MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE) {
         Ok(bytes) => bytes,
         Err(err) if err.contains("size limit exceeded") => {
-            summary.files_skipped += 1;
-            summary.files_scanned_too_large_when_uncompressed += 1;
+            summary.record_skip(SkipReason::MaxDecompressedBytes);
             eprintln!(
                 "Skipped gzip archive: decompression limit reached: {} ({})",
                 archive_path.display(),
@@ -898,8 +991,7 @@ where
     };
 
     if decompressed.is_empty() {
-        summary.files_skipped += 1;
-        summary.files_skipped_zero_size += 1;
+        summary.record_skip(SkipReason::ZeroSize);
         return Ok(());
     }
 
@@ -937,18 +1029,198 @@ fn decompress_gzip_limited<R: Read>(
 }
 
 /// Helper function to get the virtual path inside of a gzip archive.
-fn gzip_inner_virtual_path(path: &Path) -> std::path::PathBuf {
+fn gzip_inner_virtual_path(path: &Path) -> PathBuf {
+    let inner_name = gzip_inner_entry_name(path);
+    make_archive_path(path, Path::new(&inner_name))
+}
+
+/// Helper function to get the synthetic inner entry name for gzip content.
+///
+/// Examples:
+///   eicar.tar.gz -> eicar.tar
+///   archive.tgz  -> archive.tar
+///   file.txt.gz  -> file.txt
+fn gzip_inner_entry_name(path: &Path) -> String {
     let display = path.to_string_lossy();
 
-    let inner_name = if display.ends_with(".tar.gz") {
-        display.trim_end_matches(".gz").to_string()
-    } else if display.ends_with(".tgz") {
-        display.trim_end_matches(".tgz").to_string() + ".tar"
-    } else if display.ends_with(".gz") {
-        display.trim_end_matches(".gz").to_string()
+    let basename = display
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("<decompressed>");
+
+    if let Some(stem) = basename.strip_suffix(".tar.gz") {
+        format!("{stem}.tar")
+    } else if let Some(stem) = basename.strip_suffix(".tgz") {
+        format!("{stem}.tar")
+    } else if let Some(stem) = basename.strip_suffix(".gz") {
+        stem.to_string()
     } else {
         "<decompressed>".to_string()
-    };
+    }
+}
 
-    std::path::PathBuf::from(format!("{}!/{}", display, inner_name))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn archive_path_for_simple_zip_entry() {
+        let path = make_archive_path(
+            Path::new("./corpus/eicar.zip"),
+            Path::new("eicar.com"),
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from("./corpus/eicar.zip!/eicar.com")
+        );
+    }
+
+    #[test]
+    fn archive_path_strips_leading_dot_slash_from_tar_entry() {
+        let path = make_archive_path(
+            Path::new("./corpus/eicar.tar"),
+            Path::new("./eicar.com"),
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from("./corpus/eicar.tar!/eicar.com")
+        );
+    }
+
+    #[test]
+    fn archive_path_keeps_nested_entry_path() {
+        let path = make_archive_path(
+            Path::new("./corpus/outer.zip"),
+            Path::new("inner/eicar.zip"),
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from("./corpus/outer.zip!/inner/eicar.zip")
+        );
+    }
+
+    #[test]
+    fn archive_path_strips_leading_dot_slash_from_nested_entry_path() {
+        let path = make_archive_path(
+            Path::new("./corpus/outer.tar"),
+            Path::new("./inner/eicar.zip"),
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from("./corpus/outer.tar!/inner/eicar.zip")
+        );
+    }
+
+    #[test]
+    fn archive_path_can_chain_virtual_paths() {
+        let path = make_archive_path(
+            Path::new("./corpus/outer.zip!/inner/eicar.tar"),
+            Path::new("./eicar.com"),
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from("./corpus/outer.zip!/inner/eicar.tar!/eicar.com")
+        );
+    }
+
+    #[test]
+    fn gzip_inner_virtual_path_for_tar_gz_uses_basename_only() {
+        let path = gzip_inner_virtual_path(Path::new(
+            "./corpus/malicious/synthetic/eicar/eicar.tar.gz",
+        ));
+
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "./corpus/malicious/synthetic/eicar/eicar.tar.gz!/eicar.tar"
+            )
+        );
+    }
+
+    #[test]
+    fn gzip_inner_virtual_path_for_tgz_uses_tar_basename() {
+        let path = gzip_inner_virtual_path(Path::new(
+            "./corpus/archive.tgz",
+        ));
+
+        assert_eq!(
+            path,
+            PathBuf::from("./corpus/archive.tgz!/archive.tar")
+        );
+    }
+
+    #[test]
+    fn gzip_inner_virtual_path_for_plain_gz_strips_gz_from_basename() {
+        let path = gzip_inner_virtual_path(Path::new(
+            "./corpus/readme.txt.gz",
+        ));
+
+        assert_eq!(
+            path,
+            PathBuf::from("./corpus/readme.txt.gz!/readme.txt")
+        );
+    }
+
+    #[test]
+    fn gzip_inner_virtual_path_for_nested_virtual_tar_gz_uses_inner_basename_only() {
+        let path = gzip_inner_virtual_path(Path::new(
+            "./corpus/outer.zip!/inner/eicar.tar.gz",
+        ));
+
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "./corpus/outer.zip!/inner/eicar.tar.gz!/eicar.tar"
+            )
+        );
+    }
+
+    #[test]
+    fn gzip_inner_virtual_path_for_generated_tar_gz_name() {
+        let path = gzip_inner_virtual_path(Path::new(
+            "./corpus/archives/malicious/eicar_tar_gz.tar.gz",
+        ));
+
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "./corpus/archives/malicious/eicar_tar_gz.tar.gz!/eicar_tar_gz.tar"
+            )
+        );
+    }
+
+    #[test]
+    fn gzip_inner_virtual_path_for_zip_tar_gz_zip_case() {
+        let path = gzip_inner_virtual_path(Path::new(
+            "./corpus/archives/malicious/eicar_zip_inside_tar_gz.tar.gz",
+        ));
+
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "./corpus/archives/malicious/eicar_zip_inside_tar_gz.tar.gz!/eicar_zip_inside_tar_gz.tar"
+            )
+        );
+    }
+
+    #[test]
+    fn gzip_inner_virtual_path_for_tar_gz_inside_zip_case() {
+        let path = gzip_inner_virtual_path(Path::new(
+            "./corpus/archives/malicious/eicar_tar_gz_inside_zip.zip!/inner/eicar.tar.gz",
+        ));
+
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "./corpus/archives/malicious/eicar_tar_gz_inside_zip.zip!/inner/eicar.tar.gz!/eicar.tar"
+            )
+        );
+    }
 }
