@@ -19,6 +19,8 @@ pub struct ScanArgs {
     pub database: PathBuf,
     /// The compiled YARA rules cache.
     pub yara_rules_cache: PathBuf,
+    /// The output format to be used.
+    pub output_format: OutputFormat,
 }
 
 /// The arguments which an `Update` command needs.
@@ -31,6 +33,22 @@ pub struct UpdateArgs {
     pub yara_rules_path: PathBuf,
     /// The compiled YARA rules cache.
     pub yara_rules_cache: PathBuf,
+}
+
+/// The output formats supported.
+#[derive(PartialEq, Eq)]
+pub enum OutputFormat {
+    Human,
+    Json,
+}
+
+impl From<String> for OutputFormat {
+    fn from(string: String) -> OutputFormat {
+        match string.as_str() {
+            "json" => OutputFormat::Json,
+            _ => OutputFormat::Human,
+        }
+    }
 }
 
 /// Function to parse the arguments passed to the CLI.
@@ -63,6 +81,7 @@ where
     let mut target: Option<PathBuf> = None;
     let mut database = PathBuf::from(DEFAULT_DATABASE);
     let mut yara_rules_cache = PathBuf::from(DEFAULT_YARA_CACHE);
+    let mut output_format = OutputFormat::Human;
 
     let mut args = args.into_iter();
 
@@ -81,6 +100,13 @@ where
                     return Err("No arguments provided".to_string());
                 };
                 yara_rules_cache = PathBuf::from(value);
+            }
+
+            "--output" | "-o" => {
+                let Some(value) = args.next() else {
+                    return Err("No arguments provided".to_string());
+                };
+                output_format = OutputFormat::from(value);
             }
 
             value if value.starts_with("-") => {
@@ -107,6 +133,7 @@ where
         target,
         database,
         yara_rules_cache,
+        output_format,
     }))
 }
 

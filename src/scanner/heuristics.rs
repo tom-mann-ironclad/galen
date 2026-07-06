@@ -19,6 +19,16 @@ impl Verdict {
             Verdict::Malicious => "malicious",
         }
     }
+
+    pub fn json_label(self) -> &'static str {
+        match self {
+            Verdict::Clean => "clean",
+            Verdict::Informational => "informational",
+            Verdict::Suspicious => "suspicious",
+            Verdict::LikelyMalicious => "likely_malicious",
+            Verdict::Malicious => "malicious",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +40,14 @@ pub enum Confidence {
 
 impl Confidence {
     pub fn label(&self) -> &str {
+        match self {
+            Confidence::Low => "low",
+            Confidence::Medium => "medium",
+            Confidence::High => "high",
+        }
+    }
+
+    pub fn json_label(&self) -> &str {
         match self {
             Confidence::Low => "low",
             Confidence::Medium => "medium",
@@ -63,6 +81,20 @@ impl FindingId {
             FindingId::StaticLdPreloadReference => "static LRD preload reference",
             FindingId::ElfWritableExecutableSegment => "writable executable segement",
             FindingId::RuntimeMemfdExec => "runtime memfd exec",
+        }
+    }
+
+    pub fn json_label(&self) -> &str {
+        match self {
+            FindingId::KnownHash => "known_hash",
+            FindingId::SingleYaraRule => "single_yara_rule_match",
+            FindingId::MultipleYaraRules => "multiple_yara_rule_match",
+            FindingId::YaraPersistenceIndicator => "persistence_indicator",
+            FindingId::YaraRootkitIndicator => "rootkit_indicator",
+            FindingId::YaraPackerIndicator => "packer_indicator",
+            FindingId::StaticLdPreloadReference => "static_lrd_preload_reference",
+            FindingId::ElfWritableExecutableSegment => "writable_executable_segement",
+            FindingId::RuntimeMemfdExec => "runtime_memfd_exec",
         }
     }
 }

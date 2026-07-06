@@ -100,6 +100,20 @@ impl SkipReason {
         }
     }
 
+    pub fn json_label(self) -> &'static str {
+        match self {
+            SkipReason::ZeroSize => "zero_size",
+            SkipReason::MaxArchiveDepth => "maximum_recursion_reached",
+            SkipReason::MaxArchiveEntries => "maximum_archive_entries_reached",
+            SkipReason::MaxDecompressedBytes => "maximum_decompressed_size_reached",
+            SkipReason::MaxCompressionRatio => "suspicious_compression_ratio",
+            SkipReason::MalformedArchive => "malformed_archive",
+            SkipReason::UnsupportedArchive => "unsupported_archive",
+            SkipReason::ArchiveReadError => "archive_read_error",
+            SkipReason::EncryptedFile => "file_encrypted",
+        }
+    }
+
     pub const ALL: [SkipReason; Self::COUNT] = [
         SkipReason::ZeroSize,
         SkipReason::MaxArchiveDepth,
@@ -113,7 +127,7 @@ impl SkipReason {
     ];
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum DetectionSurface {
     FileSystemFile,
     ArchiveContainer,
@@ -123,11 +137,19 @@ pub enum DetectionSurface {
 impl DetectionSurface {
     pub const COUNT: usize = 3;
 
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             DetectionSurface::FileSystemFile => "filesystem file",
             DetectionSurface::ArchiveEntry => "archive entry",
             DetectionSurface::ArchiveContainer => "archive container",
+        }
+    }
+
+    pub fn json_label(&self) -> &'static str {
+        match self {
+            DetectionSurface::FileSystemFile => "filesystem_file",
+            DetectionSurface::ArchiveEntry => "archive_entry",
+            DetectionSurface::ArchiveContainer => "archive_container",
         }
     }
 

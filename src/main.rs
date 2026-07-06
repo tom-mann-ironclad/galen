@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod json;
 pub mod scanner;
 pub mod updater;
 
@@ -16,7 +17,9 @@ use crate::updater::{
     update_signatures::update_signatures_using_malware_bazaar, update_yara_rules::update_yara_rules,
 };
 
-use crate::cli::{Command, parse_args};
+use crate::cli::{Command, OutputFormat, parse_args};
+
+use crate::json::ScanReport;
 
 fn main() {
     eprintln!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -55,84 +58,98 @@ fn main() {
             let summary = scan_path(&args.target, &hash_database, &mut yara_scanner);
             let end_time = std::time::Instant::now();
             let scan_time: std::time::Duration = end_time - start_time;
-            println!();
-            if !summary.yara_rules_triggered.is_empty() {
-                println!(
-                    "{} YARA rules triggered:",
-                    summary.yara_rules_triggered.len()
-                );
+            if args.output_format == OutputFormat::Human {
+                println!();
+                if !summary.yara_rules_triggered.is_empty() {
+                    println!(
+                        "{} YARA rules triggered:",
+                        summary.yara_rules_triggered.len()
+                    );
 
-                let mut rules: Vec<_> = summary.yara_rules_triggered.iter().collect();
-                rules.sort_by_key(|(rule, _count)| rule.as_str());
+                    let mut rules: Vec<_> = summary.yara_rules_triggered.iter().collect();
+                    rules.sort_by_key(|(rule, _count)| rule.as_str());
 
-                for (rule, count) in rules {
-                    println!("  {}: {} files", rule, count);
-                }
-            }
-
-            println!();
-            println!("Detections:");
-            let mut visible_detection_records = Vec::new();
-            for record in &summary.detections {
-                if record.verdict >= Verdict::Suspicious
-                    && should_print_detection(record, &summary.detections)
-                {
-                    visible_detection_records.push(record);
-                }
-            }
-
-            for record in &visible_detection_records {
-                println!("{record}");
-            }
-
-            if summary.errors > 0 {
-                println!("Errors: {}", summary.errors);
-                std::process::exit(2);
-            }
-
-            println!("----------- SCAN SUMMARY -----------");
-            println!("Scanned {} files", summary.total_files_scanned());
-            println!("  filesystem files: {}", summary.filesystem_files_scanned);
-            println!("  archive entries: {}", summary.archive_entries_scanned);
-            println!("Scanned archives: {}", summary.archives_scanned);
-            if summary.files_skipped > 0 {
-                println!("Skipped {} files", summary.files_skipped);
-
-                for reason in SkipReason::ALL {
-                    let count = summary.skip_count(reason);
-                    if count > 0 {
-                        println!("  {}: {}", reason.label(), count);
+                    for (rule, count) in rules {
+                        println!("  {}: {} files", rule, count);
                     }
                 }
-            }
 
-            let filesystem_path_detections = visible_detection_records
-                .iter()
-                .filter(|record| record.is_filesystem_path())
-                .count();
+                println!();
+                println!("Detections:");
+                let mut visible_detection_records = Vec::new();
+                for record in &summary.detections {
+                    if record.verdict >= Verdict::Suspicious
+                        && should_display_detection(record, &summary.detections)
+                    {
+                        visible_detection_records.push(record);
+                    }
+                }
 
-            let archive_path_detections = visible_detection_records
-                .iter()
-                .filter(|record| record.is_archive_path())
-                .count();
+                for record in &visible_detection_records {
+                    println!("{record}");
+                }
 
-            println!("Detection records: {}", visible_detection_records.len());
-            if !summary.detections.is_empty() {
-                println!(
-                    "  {}: {}",
-                    DetectionSurface::FileSystemFile.label(),
-                    filesystem_path_detections
-                );
-                println!(
-                    "  {}: {}",
-                    DetectionSurface::ArchiveEntry.label(),
-                    archive_path_detections
-                );
-            }
-            println!("Scan time: {:?}", scan_time);
+                if summary.errors > 0 {
+                    println!("Errors: {}", summary.errors);
+                    std::process::exit(2);
+                }
 
-            if !visible_detection_records.is_empty() {
-                std::process::exit(1);
+                println!("----------- SCAN SUMMARY -----------");
+                println!("Scanned {} files", summary.total_files_scanned());
+                println!("  filesystem files: {}", summary.filesystem_files_scanned);
+                println!("  archive entries: {}", summary.archive_entries_scanned);
+                println!("Scanned archives: {}", summary.archives_scanned);
+                if summary.files_skipped > 0 {
+                    println!("Skipped {} files", summary.files_skipped);
+
+                    for reason in SkipReason::ALL {
+                        let count = summary.skip_count(reason);
+                        if count > 0 {
+                            println!("  {}: {}", reason.label(), count);
+                        }
+                    }
+                }
+
+                let filesystem_path_detections = visible_detection_records
+                    .iter()
+                    .filter(|record| record.is_filesystem_path())
+                    .count();
+
+                let archive_path_detections = visible_detection_records
+                    .iter()
+                    .filter(|record| record.is_archive_path())
+                    .count();
+
+                println!("Detection records: {}", visible_detection_records.len());
+                if !summary.detections.is_empty() {
+                    println!(
+                        "  {}: {}",
+                        DetectionSurface::FileSystemFile.label(),
+                        filesystem_path_detections
+                    );
+                    println!(
+                        "  {}: {}",
+                        DetectionSurface::ArchiveEntry.label(),
+                        archive_path_detections
+                    );
+                }
+                println!("Scan time: {:?}", scan_time);
+                if !visible_detection_records.is_empty() {
+                    std::process::exit(1);
+                }
+            } else if args.output_format == OutputFormat::Json {
+                let report = ScanReport::from_summary(&summary, scan_time);
+
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+
+                if summary.errors > 0 {
+                    eprintln!("Errors: {}", summary.errors);
+                    std::process::exit(2);
+                }
+
+                if !summary.detections.is_empty() {
+                    std::process::exit(1);
+                }
             }
 
             std::process::exit(0);
@@ -184,7 +201,7 @@ fn print_help() {
     println!(
         "\
 Usage:
-  galen scan <target> [--database <path>] [--yara-cache <path>]
+  galen scan <target> [--database <path>] [--yara-cache <path>] [--output <format>]
   galen update
   galen --help
 
@@ -195,6 +212,7 @@ Commands:
 Options:
   -d, --database <path>   Path to signature database
   -y, --yara-cache <path> Path to YARA rules directory
+  -o, --output            The output format for scan results: human (default) or json  
   -h, --help              Show this help text
 "
     );
@@ -210,7 +228,7 @@ fn has_child_detection(container: &Path, records: &[DetectionRecord]) -> bool {
 }
 
 /// Function to determine which detection records should be displayed.
-fn should_print_detection(record: &DetectionRecord, records: &[DetectionRecord]) -> bool {
+pub fn should_display_detection(record: &DetectionRecord, records: &[DetectionRecord]) -> bool {
     match record.surface {
         DetectionSurface::FileSystemFile => true,
         DetectionSurface::ArchiveEntry => true,
