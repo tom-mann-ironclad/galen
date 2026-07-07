@@ -54,3 +54,46 @@ pub fn load_hash_database(path: impl AsRef<Path>) -> Result<HashDatabase, rusqli
 
     Ok(database)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+
+    fn hash(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    #[test]
+    fn contains_uses_sorted_hashes() {
+        let database = HashDatabase {
+            sha256: vec![hash(1), hash(3), hash(9)],
+        };
+
+        assert!(database.contains(&FileHashes { sha256: hash(3) }));
+        assert!(!database.contains(&FileHashes { sha256: hash(4) }));
+    }
+
+    #[test]
+    fn load_hash_database_sorts_dedupes_and_ignores_invalid_lengths() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+
+        connection
+            .execute("CREATE TABLE malware_hashes (sha256 BLOB NOT NULL)", [])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO malware_hashes (sha256) VALUES (?1), (?2), (?3), (?4)",
+                params![&hash(9)[..], &hash(1)[..], &hash(9)[..], &[0_u8; 31][..]],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = load_hash_database(file.path()).unwrap();
+
+        assert_eq!(database.len(), 2);
+        assert!(database.contains(&FileHashes { sha256: hash(1) }));
+        assert!(database.contains(&FileHashes { sha256: hash(9) }));
+    }
+}

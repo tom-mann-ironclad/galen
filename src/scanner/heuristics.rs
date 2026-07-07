@@ -148,3 +148,60 @@ impl HeuristicAccumulator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finding(score: u16) -> Finding {
+        Finding {
+            id: FindingId::KnownHash,
+            score,
+            confidence: Confidence::High,
+        }
+    }
+
+    #[test]
+    fn verdict_thresholds_cover_boundary_scores() {
+        let cases = [
+            (0, Verdict::Clean),
+            (1, Verdict::Informational),
+            (29, Verdict::Informational),
+            (30, Verdict::Suspicious),
+            (59, Verdict::Suspicious),
+            (60, Verdict::LikelyMalicious),
+            (89, Verdict::LikelyMalicious),
+            (90, Verdict::Malicious),
+        ];
+
+        for (score, expected) in cases {
+            let mut accumulator = HeuristicAccumulator::new();
+            if score > 0 {
+                accumulator.add(finding(score));
+            }
+
+            assert_eq!(accumulator.verdict(), expected);
+        }
+    }
+
+    #[test]
+    fn accumulator_saturates_score_and_caps_retained_findings() {
+        let mut accumulator = HeuristicAccumulator::new();
+
+        for _ in 0..(MAX_FINDINGS_PER_FILE + 2) {
+            accumulator.add(finding(u16::MAX));
+        }
+
+        assert_eq!(accumulator.score(), u16::MAX);
+        assert_eq!(
+            accumulator.findings().iter().flatten().count(),
+            MAX_FINDINGS_PER_FILE
+        );
+    }
+
+    #[test]
+    fn labels_are_distinct_for_human_and_json_verdicts() {
+        assert_eq!(Verdict::LikelyMalicious.label(), "likely malicious");
+        assert_eq!(Verdict::LikelyMalicious.json_label(), "likely_malicious");
+    }
+}

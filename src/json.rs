@@ -212,3 +212,55 @@ impl FindingReportRecord {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scanner::heuristics::{Confidence, FindingId, Verdict};
+    use std::{path::PathBuf, time::Duration};
+
+    fn detection(path: &str, surface: DetectionSurface, score: u16) -> DetectionRecord {
+        let mut findings = [None; crate::scanner::heuristics::MAX_FINDINGS_PER_FILE];
+        findings[0] = Some(Finding {
+            id: FindingId::KnownHash,
+            score,
+            confidence: Confidence::High,
+        });
+
+        DetectionRecord {
+            path: PathBuf::from(path),
+            score,
+            verdict: Verdict::Malicious,
+            findings,
+            surface,
+        }
+    }
+
+    #[test]
+    fn scan_report_splits_visible_and_suppressed_archive_container_detections() {
+        let mut summary = ScanSummaryStats::new();
+        summary.filesystem_files_scanned = 1;
+        summary.archive_entries_scanned = 1;
+        summary.archives_scanned = 1;
+        summary.record_skip(SkipReason::ZeroSize);
+        summary.detections = vec![
+            detection("sample.zip", DetectionSurface::ArchiveContainer, 90),
+            detection("sample.zip!/payload", DetectionSurface::ArchiveEntry, 90),
+        ];
+        summary.yara_rules_triggered.insert("z_rule".to_string(), 1);
+        summary.yara_rules_triggered.insert("a_rule".to_string(), 2);
+
+        let report = ScanReport::from_summary(&summary, Duration::from_millis(25));
+
+        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.summary.scanned_files, 2);
+        assert_eq!(report.summary.visible_detection_records, 1);
+        assert_eq!(report.summary.suppressed_detection_records, 1);
+        assert_eq!(report.visible_detections[0].path, "sample.zip!/payload");
+        assert_eq!(report.suppressed_detections[0].path, "sample.zip");
+        assert_eq!(report.summary.skips[0].reason, "zero_size");
+        assert_eq!(report.summary.scan_time_ms, 25.0);
+        assert_eq!(report.yara.rules_triggered[0].rule, "a_rule");
+        assert_eq!(report.yara.rules_triggered[1].rule, "z_rule");
+    }
+}

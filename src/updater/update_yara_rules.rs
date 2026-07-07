@@ -2,9 +2,6 @@ use std::path::{Path, PathBuf};
 
 /// Function to grab the latest YARA rules and compile them into a cache on disk.
 pub fn update_yara_rules(rules_dir: &Path, cache_path: &Path) -> Result<usize, String> {
-    // Grab latest YARA rules
-    // TODO!
-
     match compile_yara_cache(rules_dir, cache_path) {
         Ok(compiled) => Ok(compiled),
         Err(err) => Err(err.to_string()),
@@ -107,4 +104,41 @@ fn is_yara_rule_file(path: &Path) -> bool {
         path.extension().and_then(|ext| ext.to_str()),
         Some("yar") | Some("yara")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn is_yara_rule_file_accepts_only_supported_extensions() {
+        assert!(is_yara_rule_file(Path::new("rule.yar")));
+        assert!(is_yara_rule_file(Path::new("rule.yara")));
+        assert!(!is_yara_rule_file(Path::new("rule.txt")));
+        assert!(!is_yara_rule_file(Path::new("rule")));
+    }
+
+    #[test]
+    fn collect_yara_rule_files_recurses_and_sorts_results() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+
+        std::fs::File::create(root.path().join("b.yar"))
+            .unwrap()
+            .write_all(b"rule b { condition: true }")
+            .unwrap();
+        std::fs::File::create(nested.join("a.yara"))
+            .unwrap()
+            .write_all(b"rule a { condition: true }")
+            .unwrap();
+        std::fs::File::create(root.path().join("ignored.txt")).unwrap();
+
+        let paths = collect_yara_rule_files(root.path());
+
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], root.path().join("b.yar"));
+        assert_eq!(paths[1], nested.join("a.yara"));
+    }
 }

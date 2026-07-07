@@ -145,7 +145,9 @@ fn classify_yara_rule<'a>(
 
 fn contains_class_hint(value: &str, needles: &[&str]) -> bool {
     let value = value.to_ascii_lowercase();
-    needles.iter().any(|needle| value.contains(needle))
+    needles
+        .iter()
+        .any(|needle| value.contains(&needle.to_ascii_lowercase()))
 }
 
 fn infer_persistence_strength<'a>(
@@ -204,5 +206,64 @@ pub fn score_matched_rule(class: &YaraRuleClass, strength: &RuleStrength) -> (u1
 
         (_, RuleStrength::GenericPrimitive) => (5, Confidence::Low),
         _ => (10, Confidence::Low),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_yara_rule_uses_identifier_tags_and_metadata_hints() {
+        assert!(matches!(
+            classify_yara_rule("linux_ld_preload_backdoor", [], []),
+            YaraRuleClass::Persistence
+        ));
+        assert!(matches!(
+            classify_yara_rule("generic_rule", ["credential_theft"], []),
+            YaraRuleClass::CredentialAccess
+        ));
+        assert!(matches!(
+            classify_yara_rule("generic_rule", [], ["EICAR"]),
+            YaraRuleClass::EICAR
+        ));
+        assert!(matches!(
+            classify_yara_rule("generic_rule", ["upx"], []),
+            YaraRuleClass::PackerOrObfuscation
+        ));
+    }
+
+    #[test]
+    fn infer_persistence_strength_increases_when_multiple_primitives_are_seen() {
+        assert!(matches!(
+            infer_persistence_strength("cron_rule", std::iter::empty()),
+            RuleStrength::GenericPrimitive
+        ));
+        assert!(matches!(
+            infer_persistence_strength("cron_rule", ["systemd"]),
+            RuleStrength::CombinedSuspiciousPrimitives
+        ));
+    }
+
+    #[test]
+    fn score_matched_rule_covers_high_confidence_and_low_signal_rules() {
+        assert_eq!(
+            score_matched_rule(&YaraRuleClass::EICAR, &RuleStrength::GenericPrimitive),
+            (80, Confidence::High)
+        );
+        assert_eq!(
+            score_matched_rule(
+                &YaraRuleClass::Persistence,
+                &RuleStrength::CombinedSuspiciousPrimitives
+            ),
+            (20, Confidence::Low)
+        );
+        assert_eq!(
+            score_matched_rule(
+                &YaraRuleClass::CredentialAccess,
+                &RuleStrength::ConcreteTechnique
+            ),
+            (45, Confidence::Medium)
+        );
     }
 }

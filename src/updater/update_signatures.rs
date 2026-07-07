@@ -272,3 +272,66 @@ fn malware_hash_count(path: impl AsRef<Path>) -> Result<i64, rusqlite::Error> {
         connection.query_row("SELECT COUNT(*) FROM malware_hashes", [], |row| row.get(0))?;
     Ok(count)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::io::Cursor;
+
+    #[test]
+    fn decode_sha256_hex_accepts_upper_and_lower_case() {
+        let decoded =
+            decode_sha256_hex("000102030405060708090a0b0c0d0e0f101112131415161718191A1B1C1D1E1F")
+                .unwrap();
+
+        assert_eq!(decoded[0], 0x00);
+        assert_eq!(decoded[10], 0x0a);
+        assert_eq!(decoded[31], 0x1f);
+    }
+
+    #[test]
+    fn decode_sha256_hex_rejects_bad_length_and_bad_nibbles() {
+        assert!(decode_sha256_hex("abc").is_none());
+        assert!(
+            decode_sha256_hex("zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_malware_bazaar_timestamp_handles_valid_missing_and_invalid_values() {
+        assert_eq!(
+            parse_malware_bazaar_timestamp(Some("1970-01-01 00:00:01")),
+            Some(1)
+        );
+        assert_eq!(parse_malware_bazaar_timestamp(None), None);
+        assert_eq!(
+            parse_malware_bazaar_timestamp(Some("not a timestamp")),
+            None
+        );
+    }
+
+    #[test]
+    fn insert_hash_lines_skips_comments_blanks_invalid_and_duplicates() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+
+        let data = b"
+# comment
+000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+invalid
+000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+";
+
+        let inserted = insert_hash_lines(file.path(), Cursor::new(data)).unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM malware_hashes", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        assert_eq!(count, 2);
+    }
+}

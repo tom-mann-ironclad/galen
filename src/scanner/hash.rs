@@ -52,3 +52,34 @@ pub fn hash_file_from_memory(buffer: &[u8]) -> Result<FileHashes, std::io::Error
 
     Ok(FileHashes { sha256: sha256_out })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn hashes_empty_buffer_to_known_sha256() {
+        let hashes = hash_file_from_memory(b"").unwrap();
+
+        assert_eq!(
+            hex(&hashes.sha256),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn disk_and_memory_hashes_match() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"galen test payload").unwrap();
+
+        let from_disk = hash_file_from_disk(file.path()).unwrap();
+        let from_memory = hash_file_from_memory(b"galen test payload").unwrap();
+
+        assert_eq!(from_disk, from_memory);
+    }
+}

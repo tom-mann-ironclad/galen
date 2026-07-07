@@ -212,7 +212,7 @@ impl std::fmt::Display for DetectionRecord {
 #[derive(Debug)]
 enum HashScanResult {
     Clean,
-    KnownHash { family: Option<String> },
+    KnownHash { _family: Option<String> },
 }
 
 /// The result of scanning a single file against YARA rules.
@@ -279,7 +279,7 @@ fn compare_hashes(
     hash_database: &HashDatabase,
 ) -> Result<HashScanResult, String> {
     if hash_database.contains(&hashes) {
-        return Ok(HashScanResult::KnownHash { family: None });
+        return Ok(HashScanResult::KnownHash { _family: None });
     };
     Ok(HashScanResult::Clean)
 }
@@ -372,7 +372,7 @@ fn scan_one_and_report(
 
     match hash_result {
         HashScanResult::Clean => {}
-        HashScanResult::KnownHash { family: _ } => {
+        HashScanResult::KnownHash { _family: _ } => {
             summary.known_hash_detections += 1;
             heuristics.add(Finding {
                 id: FindingId::KnownHash,
@@ -691,7 +691,7 @@ fn scan_bytes(
     };
     match hash_result {
         HashScanResult::Clean => {}
-        HashScanResult::KnownHash { family: _ } => {
+        HashScanResult::KnownHash { _family: _ } => {
             summary.known_hash_detections += 1;
             heuristics.add(Finding {
                 id: FindingId::KnownHash,
@@ -1168,7 +1168,97 @@ fn gzip_inner_entry_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
+
+    fn compile_rules(source: &str) -> yara_x::Rules {
+        let mut compiler = yara_x::Compiler::new();
+        compiler.add_source(source).unwrap();
+        compiler.build()
+    }
+
+    fn non_matching_rules() -> yara_x::Rules {
+        compile_rules("rule never_matches { condition: false }")
+    }
+
+    fn gzip_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn hash_database_for_payload(payload: &[u8]) -> (tempfile::NamedTempFile, HashDatabase) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let connection = rusqlite::Connection::open(file.path()).unwrap();
+        let sha256 = hash_file_from_memory(payload).unwrap().sha256;
+
+        connection
+            .execute("CREATE TABLE malware_hashes (sha256 BLOB NOT NULL)", [])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO malware_hashes (sha256) VALUES (?1)",
+                rusqlite::params![&sha256[..]],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = crate::scanner::database::load_hash_database(file.path()).unwrap();
+
+        (file, database)
+    }
+
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        writer.add_directory("ignored-dir/", options).unwrap();
+
+        for (path, bytes) in entries {
+            writer.start_file(path, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn tar_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+
+        for (path, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, *bytes).unwrap();
+        }
+
+        builder.finish().unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    fn tar_header_declaring_size(path: &str, size: u64) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        header.as_bytes().to_vec()
+    }
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic read failure",
+            ))
+        }
+    }
 
     #[test]
     fn archive_path_for_simple_zip_entry() {
@@ -1289,5 +1379,593 @@ mod tests {
                 "./corpus/archives/malicious/eicar_tar_gz_inside_zip.zip!/inner/eicar.tar.gz!/eicar.tar"
             )
         );
+    }
+
+    #[test]
+    fn skip_summary_counts_each_reason_independently() {
+        let mut summary = ScanSummaryStats::new();
+
+        summary.record_skip(SkipReason::ZeroSize);
+        summary.record_skip(SkipReason::ZeroSize);
+        summary.record_skip(SkipReason::EncryptedFile);
+
+        assert_eq!(summary.files_skipped, 3);
+        assert_eq!(summary.skip_count(SkipReason::ZeroSize), 2);
+        assert_eq!(summary.skip_count(SkipReason::EncryptedFile), 1);
+        assert_eq!(summary.skip_count(SkipReason::MalformedArchive), 0);
+    }
+
+    #[test]
+    fn archive_kind_detection_recognizes_magic_bytes() {
+        let mut tar_header = [0_u8; 512];
+        tar_header[257..263].copy_from_slice(b"ustar\0");
+
+        assert!(matches!(
+            detect_archive_kind(b"PK\x03\x04anything").unwrap(),
+            ArchiveKind::Zip
+        ));
+        assert!(matches!(
+            detect_archive_kind(&[0x1f, 0x8b, 0x08]).unwrap(),
+            ArchiveKind::Gzip
+        ));
+        assert!(matches!(
+            detect_archive_kind(&tar_header).unwrap(),
+            ArchiveKind::Tar
+        ));
+        assert!(matches!(
+            detect_archive_kind(b"plain text").unwrap(),
+            ArchiveKind::Unknown
+        ));
+    }
+
+    #[test]
+    fn normalise_archive_entry_name_removes_escape_components() {
+        assert_eq!(
+            normalise_archive_entry_name(Path::new("/tmp/../payload")),
+            PathBuf::from("tmp/payload")
+        );
+        assert_eq!(
+            normalise_archive_entry_name(Path::new("../../")),
+            PathBuf::from("<unnamed>")
+        );
+    }
+
+    #[test]
+    fn read_limited_into_errors_and_clears_output_when_limit_is_exceeded() {
+        let mut input = std::io::Cursor::new(b"abcdef");
+        let mut output = vec![1, 2, 3];
+
+        let err = read_limited_into(&mut input, &mut output, 5).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn read_limited_into_propagates_reader_errors() {
+        let mut input = FailingReader;
+        let mut output = vec![1, 2, 3];
+
+        let err = read_limited_into(&mut input, &mut output, 5).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn scan_path_reports_error_for_missing_target() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let target = tempfile::tempdir().unwrap().path().join("missing.bin");
+
+        let summary = scan_path(&target, &database, &mut scanner);
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.total_files_scanned(), 0);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_path_skips_zero_size_file_without_counting_it_as_scanned() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let file = tempfile::NamedTempFile::new().unwrap();
+
+        let summary = scan_path(file.path(), &database, &mut scanner);
+
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.skip_count(SkipReason::ZeroSize), 1);
+        assert_eq!(summary.filesystem_files_scanned, 0);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_path_recurses_directories_and_counts_small_files() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(root.path().join("one.bin"), b"one").unwrap();
+        std::fs::write(nested.join("two.bin"), b"two").unwrap();
+        std::fs::write(nested.join("empty.bin"), b"").unwrap();
+
+        let summary = scan_path(root.path(), &database, &mut scanner);
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.filesystem_files_scanned, 2);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.total_files_scanned(), 2);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_one_and_report_counts_clean_small_files_without_detection() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"clean small file").unwrap();
+
+        scan_one_and_report(file.path(), &database, &mut scanner, &mut summary);
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.filesystem_files_scanned, 1);
+        assert_eq!(summary.known_hash_detections, 0);
+        assert_eq!(summary.yara_detections, 0);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_one_and_report_records_known_hash_detection() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let payload = b"known hash payload";
+        let (_database_file, database) = hash_database_for_payload(payload);
+        let mut summary = ScanSummaryStats::new();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), payload).unwrap();
+
+        scan_one_and_report(file.path(), &database, &mut scanner, &mut summary);
+
+        assert_eq!(summary.filesystem_files_scanned, 1);
+        assert_eq!(summary.known_hash_detections, 1);
+        assert_eq!(summary.detections.len(), 1);
+        assert_eq!(summary.detections[0].score, 100);
+        assert_eq!(summary.detections[0].verdict, Verdict::Malicious);
+        assert_eq!(
+            summary.detections[0].surface,
+            DetectionSurface::FileSystemFile
+        );
+    }
+
+    #[test]
+    fn scan_one_and_report_records_yara_detection_for_files_over_threshold() {
+        let rules = compile_rules(
+            r#"
+            rule EICAR_File_Test {
+                strings:
+                    $marker = "filesystem-yara-marker"
+                condition:
+                    $marker
+            }
+            "#,
+        );
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            b"prefix filesystem-yara-marker suffix with enough bytes",
+        )
+        .unwrap();
+
+        scan_one_and_report(file.path(), &database, &mut scanner, &mut summary);
+
+        assert_eq!(summary.filesystem_files_scanned, 1);
+        assert_eq!(summary.yara_detections, 1);
+        assert_eq!(summary.yara_rules_triggered["EICAR_File_Test"], 1);
+        assert_eq!(summary.detections.len(), 1);
+        assert_eq!(
+            summary.detections[0].surface,
+            DetectionSurface::FileSystemFile
+        );
+        assert_eq!(summary.detections[0].verdict, Verdict::LikelyMalicious);
+    }
+
+    #[test]
+    fn scan_one_and_report_counts_error_for_malformed_archive_container() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"PK\x03\x04not really a zip but long enough").unwrap();
+
+        scan_one_and_report(file.path(), &database, &mut scanner, &mut summary);
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.filesystem_files_scanned, 1);
+        assert_eq!(summary.archives_scanned, 1);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_bytes_skips_empty_archive_entry() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+
+        scan_bytes(
+            Path::new("archive.zip!/empty"),
+            b"",
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.skip_count(SkipReason::ZeroSize), 1);
+        assert_eq!(summary.archive_entries_scanned, 0);
+    }
+
+    #[test]
+    fn scan_bytes_records_yara_detection_for_archive_entry() {
+        let rules = compile_rules(
+            r#"
+            rule EICAR_Test {
+                strings:
+                    $marker = "galen-test-marker"
+                condition:
+                    $marker
+            }
+            "#,
+        );
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let payload = b"prefix galen-test-marker suffix with enough bytes for yara";
+
+        scan_bytes(
+            Path::new("archive.zip!/payload.bin"),
+            payload,
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert_eq!(summary.yara_detections, 1);
+        assert_eq!(summary.yara_rules_triggered["EICAR_Test"], 1);
+        assert_eq!(summary.detections.len(), 1);
+        assert_eq!(
+            summary.detections[0].path,
+            PathBuf::from("archive.zip!/payload.bin")
+        );
+        assert_eq!(
+            summary.detections[0].surface,
+            DetectionSurface::ArchiveEntry
+        );
+        assert_eq!(summary.detections[0].verdict, Verdict::LikelyMalicious);
+    }
+
+    #[test]
+    fn scan_bytes_records_error_for_malformed_nested_zip_but_counts_container_entry() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let malformed_zip = b"PK\x03\x04not really a zip but long enough";
+
+        scan_bytes(
+            Path::new("outer.zip!/bad.zip"),
+            malformed_zip,
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_bytes_records_error_for_malformed_nested_gzip_but_counts_container_entry() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let mut malformed_gzip = vec![0x1f, 0x8b];
+        malformed_gzip.extend_from_slice(b"not really gzip but long enough for archive probing");
+
+        scan_bytes(
+            Path::new("outer.zip!/bad.gz"),
+            &malformed_gzip,
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_gzip_reader_scans_decompressed_payload_as_archive_entry() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let compressed = gzip_bytes(b"small payload");
+
+        scan_gzip_reader(
+            std::io::Cursor::new(compressed),
+            Path::new("payload.txt.gz"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert_eq!(summary.files_skipped, 0);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_gzip_reader_records_error_for_invalid_gzip() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+
+        scan_gzip_reader(
+            std::io::Cursor::new(b"not gzip".to_vec()),
+            Path::new("bad.gz"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.files_skipped, 0);
+    }
+
+    #[test]
+    fn scan_gzip_reader_skips_empty_decompressed_payload() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+
+        scan_gzip_reader(
+            std::io::Cursor::new(gzip_bytes(b"")),
+            Path::new("empty.gz"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.skip_count(SkipReason::ZeroSize), 1);
+        assert_eq!(summary.archive_entries_scanned, 0);
+    }
+
+    #[test]
+    fn scan_gzip_reader_records_max_depth_skip_before_scanning() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+
+        scan_gzip_reader(
+            std::io::Cursor::new(gzip_bytes(b"payload")),
+            Path::new("nested.gz"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            MAX_ALLOWED_RECURSION,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 0);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveDepth), 1);
+    }
+
+    #[test]
+    fn decompress_gzip_limited_rejects_payloads_over_limit() {
+        let err =
+            decompress_gzip_limited(std::io::Cursor::new(gzip_bytes(b"abcdef")), 5).unwrap_err();
+
+        assert_eq!(err, "gzip decompressed size limit exceeded");
+    }
+
+    #[test]
+    fn scan_zip_archive_scans_file_entries_and_skips_empty_entries() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let archive = zip_bytes(&[("dir/payload.bin", b"payload"), ("empty.bin", b"")]);
+
+        scan_zip_archive(
+            std::io::Cursor::new(archive),
+            Path::new("sample.zip"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.skip_count(SkipReason::ZeroSize), 1);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_zip_archive_records_max_depth_skip_before_opening_reader() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+
+        scan_zip_archive(
+            std::io::Cursor::new(Vec::new()),
+            Path::new("too-deep.zip"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            MAX_ALLOWED_RECURSION,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 0);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveDepth), 1);
+    }
+
+    #[test]
+    fn scan_zip_archive_returns_error_for_malformed_zip() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+
+        let err = scan_zip_archive(
+            std::io::Cursor::new(b"not a zip".to_vec()),
+            Path::new("bad.zip"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("invalid Zip archive"));
+        assert_eq!(summary.archives_scanned, 1);
+    }
+
+    #[test]
+    fn scan_tar_archive_scans_file_entries_and_ignores_directories() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let archive = tar_bytes(&[("dir/payload.bin", b"payload"), ("empty.bin", b"")]);
+
+        scan_tar_archive(
+            std::io::Cursor::new(archive),
+            Path::new("sample.tar"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.skip_count(SkipReason::ZeroSize), 1);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_tar_archive_records_error_for_malformed_entry() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+
+        scan_tar_archive(
+            std::io::Cursor::new(b"not a tar archive".to_vec()),
+            Path::new("bad.tar"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.archive_entries_scanned, 0);
+    }
+
+    #[test]
+    fn scan_tar_archive_skips_entries_declaring_too_many_bytes() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let archive =
+            tar_header_declaring_size("oversized.bin", MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE + 1);
+
+        scan_tar_archive(
+            std::io::Cursor::new(archive),
+            Path::new("oversized.tar"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.skip_count(SkipReason::MaxDecompressedBytes), 1);
+        assert_eq!(summary.archive_entries_scanned, 0);
+    }
+
+    #[test]
+    fn scan_tar_archive_records_max_depth_skip_before_reading_entries() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+
+        scan_tar_archive(
+            std::io::Cursor::new(Vec::new()),
+            Path::new("too-deep.tar"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            MAX_ALLOWED_RECURSION,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 0);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveDepth), 1);
     }
 }
