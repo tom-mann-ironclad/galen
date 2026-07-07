@@ -2,6 +2,14 @@
 name = "galen"
 version = "0.1.0"
 edition = "2024"
+authors = ["Tom Mann <tom.mann@ironclad-software.com>"]
+license = "GPL-3.0-or-later"
+description = "A local Linux anti-malware scanner with hash, YARA, heuristic, and archive scanning support."
+readme = "README.md"
+repository = "https://github.com/tom-mann-ironclad/galen"
+keywords = ["linux", "malware", "scanner", "yara", "security"]
+categories = ["command-line-utilities"]
+publish = false
 
 [dependencies]
 chrono = "0.4.45"
