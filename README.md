@@ -33,7 +33,7 @@ Still in progress:
 * Configurable scan limits
 * CI/CD
 * Packaging
-* SBOM/build assurance
+* build assurance
 * Broader clean and malicious corpus testing
 * More mature operator documentation
 
