@@ -39,6 +39,14 @@ Still in progress:
 
 The current goal is to make Galen predictable, testable, and safe to operate before adding more advanced detection features.
 
+## Build assurance
+
+Normal CI builds are treated as snapshot artifacts and are not releases.
+
+Tagged releases are currently alpha-only and use tags such as `v0.1.0-alpha.1`. Release builds run formatting, Clippy, tests, RustSec advisory checks, release compilation, CycloneDX SBOM generation, checksumming, and SLSA provenance generation.
+
+This is early build-assurance work and not a claim that Galen is production-hardened.
+
 ## Example Output
 
 ```text

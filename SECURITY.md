@@ -19,6 +19,8 @@ Known advisories are not silently ignored. If an advisory cannot be resolved imm
 * mitigation or workaround;
 * planned resolution.
 
+Known advisories with this documentation may be added to the `.cargo/audit.toml` file if they are acceptable to release with.
+
 Current known advisories include:
 
 ```text

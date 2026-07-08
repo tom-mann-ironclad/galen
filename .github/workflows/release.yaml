@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+jobs:
+  build:
+    name: Build alpha release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require alpha release tag
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
+            echo "Galen releases are currently alpha-only."
+            echo "Use a tag such as v0.1.0-alpha.1"
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Check RustSec advisories
+        run: cargo audit --deny warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          BINARY="galen-${VERSION}-linux-x86_64"
+
+          cp target/release/galen "dist/${BINARY}"
+
+          cargo cyclonedx --format json
+
+          # Adjust this if cargo-cyclonedx emits a different filename locally.
+          if [[ -f "galen.cdx.json" ]]; then
+            cp galen.cdx.json "dist/galen-${VERSION}.cdx.json"
+          else
+            echo "Could not find expected CycloneDX SBOM output: galen.cdx.json"
+            find . -maxdepth 2 -name "*.cdx.json" -o -name "bom.json"
+            exit 1
+          fi
+
+          cd dist
+          sha256sum "${BINARY}" "galen-${VERSION}.cdx.json" > checksums.txt
+
+      - name: Generate subject hashes for SLSA
+        id: hash
+        run: |
+          set -euo pipefail
+          cd dist
+          echo "hashes=$(cat checksums.txt | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: galen-release-assets
+          path: |
+            dist/galen-*
+            dist/checksums.txt
+
+      - name: Create GitHub prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/galen-*
+            dist/checksums.txt
+
+  provenance:
+    name: Generate SLSA provenance
+    needs: [build]
+
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.build.outputs.hashes }}"
+      upload-assets: true
