@@ -67,10 +67,11 @@ pub enum SkipReason {
     UnsupportedArchive,
     ArchiveReadError,
     EncryptedFile,
+    FileIsSymLink,
 }
 
 impl SkipReason {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
 
     pub fn as_index(self) -> usize {
         match self {
@@ -83,6 +84,7 @@ impl SkipReason {
             SkipReason::UnsupportedArchive => 6,
             SkipReason::ArchiveReadError => 7,
             SkipReason::EncryptedFile => 8,
+            SkipReason::FileIsSymLink => 9,
         }
     }
 
@@ -97,6 +99,7 @@ impl SkipReason {
             SkipReason::UnsupportedArchive => "unsupported archive",
             SkipReason::ArchiveReadError => "archive read error",
             SkipReason::EncryptedFile => "file encrypted",
+            SkipReason::FileIsSymLink => "file is symlink",
         }
     }
 
@@ -111,6 +114,7 @@ impl SkipReason {
             SkipReason::UnsupportedArchive => "unsupported_archive",
             SkipReason::ArchiveReadError => "archive_read_error",
             SkipReason::EncryptedFile => "file_encrypted",
+            SkipReason::FileIsSymLink => "file_is_symlink",
         }
     }
 
@@ -124,6 +128,7 @@ impl SkipReason {
         SkipReason::UnsupportedArchive,
         SkipReason::ArchiveReadError,
         SkipReason::EncryptedFile,
+        SkipReason::FileIsSymLink,
     ];
 }
 
@@ -236,11 +241,22 @@ pub fn scan_path(
     yara_scanner: &mut yara_x::Scanner,
 ) -> ScanSummaryStats {
     let mut summary = ScanSummaryStats::new();
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            summary.errors += 1;
+            eprintln!("Unable to get metadata from {:?}: {}", path, err);
+            return summary;
+        }
+    };
+    let file_type = metadata.file_type();
 
-    if path.is_file() {
+    if file_type.is_file() {
         scan_one_and_report(path, hash_database, yara_scanner, &mut summary);
-    } else if path.is_dir() {
+    } else if file_type.is_dir() {
         scan_directory(path, hash_database, yara_scanner, &mut summary);
+    } else if file_type.is_symlink() {
+        summary.record_skip(SkipReason::FileIsSymLink);
     } else {
         eprintln!("Skipping non-file target: {:?}", path);
         summary.errors += 1;
@@ -345,7 +361,7 @@ fn scan_one_and_report(
 ) {
     let mut heuristics = HeuristicAccumulator::new();
     let mut surface = DetectionSurface::FileSystemFile;
-    let metadata = match path.metadata() {
+    let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) => {
             summary.errors += 1;
@@ -353,6 +369,12 @@ fn scan_one_and_report(
             return;
         }
     };
+
+    // Guard to skip symlinks
+    if metadata.file_type().is_symlink() {
+        summary.record_skip(SkipReason::FileIsSymLink);
+        return;
+    }
 
     // Guard to avoid scanning 0-length files
     if metadata.len() == 0 {
@@ -542,13 +564,23 @@ fn scan_directory(
         };
 
         let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                summary.errors += 1;
+                eprintln!("Unable to read metadata for {}: {}", path.display(), err);
+                continue;
+            }
+        };
+        let file_type = metadata.file_type();
 
-        if path.is_dir() {
+        if file_type.is_dir() {
             scan_directory(&path, hash_database, yara_scanner, summary);
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             scan_one_and_report(&path, hash_database, yara_scanner, summary);
-        } else {
-            // ignore symlinks, etc. for now
+        } else if file_type.is_symlink() {
+            summary.record_skip(SkipReason::FileIsSymLink);
+            eprintln!("Skipping {:?} because it is a symlink", path);
             continue;
         }
     }
@@ -1170,6 +1202,8 @@ mod tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
     use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
 
     fn compile_rules(source: &str) -> yara_x::Rules {
@@ -1499,6 +1533,93 @@ mod tests {
         assert_eq!(summary.filesystem_files_scanned, 2);
         assert_eq!(summary.files_skipped, 1);
         assert_eq!(summary.total_files_scanned(), 2);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_path_ignores_symlinked_directory_entries() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        std::fs::write(root.path().join("inside.bin"), b"inside").unwrap();
+        std::fs::write(outside.path().join("outside.bin"), b"outside").unwrap();
+        symlink(outside.path(), root.path().join("linked-dir")).unwrap();
+
+        let summary = scan_path(root.path(), &database, &mut scanner);
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.filesystem_files_scanned, 1);
+        assert_eq!(summary.skip_count(SkipReason::FileIsSymLink), 1);
+        assert_eq!(summary.total_files_scanned(), 1);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_path_ignores_symlinked_file_entries() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.bin");
+
+        std::fs::write(root.path().join("inside.bin"), b"inside").unwrap();
+        std::fs::write(&outside_file, b"outside").unwrap();
+        symlink(&outside_file, root.path().join("linked-file.bin")).unwrap();
+
+        let summary = scan_path(root.path(), &database, &mut scanner);
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.filesystem_files_scanned, 1);
+        assert_eq!(summary.skip_count(SkipReason::FileIsSymLink), 1);
+        assert_eq!(summary.total_files_scanned(), 1);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_path_skips_explicit_symlink_target() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let root = tempfile::tempdir().unwrap();
+        let real_file = root.path().join("real.bin");
+        let linked_file = root.path().join("linked.bin");
+
+        std::fs::write(&real_file, b"real").unwrap();
+        symlink(&real_file, &linked_file).unwrap();
+
+        let summary = scan_path(&linked_file, &database, &mut scanner);
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.filesystem_files_scanned, 0);
+        assert_eq!(summary.skip_count(SkipReason::FileIsSymLink), 1);
+        assert_eq!(summary.total_files_scanned(), 0);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_path_does_not_follow_symlink_loop() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let root = tempfile::tempdir().unwrap();
+
+        std::fs::write(root.path().join("inside.bin"), b"inside").unwrap();
+        symlink(root.path(), root.path().join("loop")).unwrap();
+
+        let summary = scan_path(root.path(), &database, &mut scanner);
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.filesystem_files_scanned, 1);
+        assert_eq!(summary.skip_count(SkipReason::FileIsSymLink), 1);
+        assert_eq!(summary.total_files_scanned(), 1);
         assert!(summary.detections.is_empty());
     }
 
