@@ -225,7 +225,6 @@ Near-term priorities:
 * Add configurable scan limits
 * Add regression tests for archive edge cases
 * Improve CI with additional testing, cross compilation, benchmarking and code security steps
-* Decide MSRV
 
 Later priorities:
 
@@ -284,9 +283,9 @@ When testing:
 
 ## Minimum Supported Rust Version
 
-Galen currently requires Rust 1.85 or newer.
+Galen currently requires Rust 1.95 or newer.
 
-This is because Galen uses the Rust 2024 edition, which was stabilized in Rust 1.85.0.
+This is because Galen uses the Rust 2024 edition, which was stabilized in Rust 1.95.0.
 
 ## Project Philosophy
 
