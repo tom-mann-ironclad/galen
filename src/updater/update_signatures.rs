@@ -279,6 +279,15 @@ mod tests {
     use rusqlite::Connection;
     use std::io::Cursor;
 
+    fn sample(hash: &str, family: Option<&str>, file_type: Option<&str>) -> MalwareBazaarSample {
+        MalwareBazaarSample {
+            sha256_hash: hash.to_string(),
+            family: family.map(str::to_string),
+            first_seen: Some("1970-01-01 00:00:01".to_string()),
+            file_type: file_type.map(str::to_string),
+        }
+    }
+
     #[test]
     fn decode_sha256_hex_accepts_upper_and_lower_case() {
         let decoded =
@@ -288,6 +297,17 @@ mod tests {
         assert_eq!(decoded[0], 0x00);
         assert_eq!(decoded[10], 0x0a);
         assert_eq!(decoded[31], 0x1f);
+    }
+
+    #[test]
+    fn decode_sha256_hex_combines_high_and_low_nibbles() {
+        let decoded =
+            decode_sha256_hex("12abf00000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
+
+        assert_eq!(decoded[0], 0x12);
+        assert_eq!(decoded[1], 0xab);
+        assert_eq!(decoded[2], 0xf0);
     }
 
     #[test]
@@ -333,5 +353,95 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 
         assert_eq!(inserted, 2);
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn insert_malware_bazaar_hashes_counts_valid_changed_rows() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+        let samples = [
+            sample(
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                Some("family-a"),
+                Some("elf"),
+            ),
+            sample("invalid", Some("ignored"), Some("ignored")),
+            sample(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                Some("family-b"),
+                Some("script"),
+            ),
+        ];
+
+        let inserted = insert_malware_bazaar_hashes(file.path(), &samples).unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM malware_hashes", [], |row| row.get(0))
+            .unwrap();
+        let family: String = connection
+            .query_row(
+                "SELECT family FROM malware_hashes WHERE file_type = 'elf'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let first_seen: i64 = connection
+            .query_row(
+                "SELECT first_seen FROM malware_hashes WHERE file_type = 'elf'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        assert_eq!(count, 2);
+        assert_eq!(family, "family-a");
+        assert_eq!(first_seen, 1);
+    }
+
+    #[test]
+    fn insert_malware_bazaar_hashes_updates_existing_rows() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+        let hash = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+        assert_eq!(
+            insert_malware_bazaar_hashes(file.path(), &[sample(hash, Some("old"), None)]).unwrap(),
+            1
+        );
+        assert_eq!(
+            insert_malware_bazaar_hashes(file.path(), &[sample(hash, Some("new"), Some("elf"))])
+                .unwrap(),
+            1
+        );
+
+        let connection = Connection::open(file.path()).unwrap();
+        let (count, family, file_type): (i64, String, String) = connection
+            .query_row(
+                "SELECT COUNT(*), family, file_type FROM malware_hashes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(family, "new");
+        assert_eq!(file_type, "elf");
+    }
+
+    #[test]
+    fn malware_hash_count_reports_current_database_size() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+
+        assert_eq!(malware_hash_count(file.path()).unwrap(), 0);
+
+        insert_hash_lines(
+            file.path(),
+            Cursor::new(b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n"),
+        )
+        .unwrap();
+
+        assert_eq!(malware_hash_count(file.path()).unwrap(), 1);
     }
 }

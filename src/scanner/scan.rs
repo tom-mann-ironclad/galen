@@ -1259,6 +1259,18 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    fn zip_bytes_with_zero_file(path: &str, size: u64) -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        writer.start_file(path, options).unwrap();
+        std::io::copy(&mut std::io::repeat(0).take(size), &mut writer).unwrap();
+
+        writer.finish().unwrap().into_inner()
+    }
+
     fn tar_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
 
@@ -1427,6 +1439,137 @@ mod tests {
         assert_eq!(summary.skip_count(SkipReason::ZeroSize), 2);
         assert_eq!(summary.skip_count(SkipReason::EncryptedFile), 1);
         assert_eq!(summary.skip_count(SkipReason::MalformedArchive), 0);
+    }
+
+    #[test]
+    fn skip_reason_labels_are_stable() {
+        let cases = [
+            (SkipReason::ZeroSize, "zero-size", "zero_size"),
+            (
+                SkipReason::MaxArchiveDepth,
+                "maximum recursion reached",
+                "maximum_recursion_reached",
+            ),
+            (
+                SkipReason::MaxArchiveEntries,
+                "maximum archive entries reached",
+                "maximum_archive_entries_reached",
+            ),
+            (
+                SkipReason::MaxDecompressedBytes,
+                "maximum decompressed size reached",
+                "maximum_decompressed_size_reached",
+            ),
+            (
+                SkipReason::MaxCompressionRatio,
+                "suspicious compression ratio",
+                "suspicious_compression_ratio",
+            ),
+            (
+                SkipReason::MalformedArchive,
+                "malformed archive",
+                "malformed_archive",
+            ),
+            (
+                SkipReason::UnsupportedArchive,
+                "unsupported archive",
+                "unsupported_archive",
+            ),
+            (
+                SkipReason::ArchiveReadError,
+                "archive read error",
+                "archive_read_error",
+            ),
+            (
+                SkipReason::EncryptedFile,
+                "file encrypted",
+                "file_encrypted",
+            ),
+            (
+                SkipReason::FileIsSymLink,
+                "file is symlink",
+                "file_is_symlink",
+            ),
+        ];
+
+        assert_eq!(SkipReason::ALL.len(), SkipReason::COUNT);
+
+        for (reason, label, json_label) in cases {
+            assert_eq!(reason.label(), label);
+            assert_eq!(reason.json_label(), json_label);
+        }
+    }
+
+    #[test]
+    fn detection_surface_labels_and_path_helpers_are_stable() {
+        let cases = [
+            (
+                DetectionSurface::FileSystemFile,
+                "filesystem file",
+                "filesystem_file",
+            ),
+            (
+                DetectionSurface::ArchiveEntry,
+                "archive entry",
+                "archive_entry",
+            ),
+            (
+                DetectionSurface::ArchiveContainer,
+                "archive container",
+                "archive_container",
+            ),
+        ];
+
+        assert_eq!(DetectionSurface::ALL.len(), DetectionSurface::COUNT);
+
+        for (surface, label, json_label) in cases {
+            assert_eq!(surface.label(), label);
+            assert_eq!(surface.json_label(), json_label);
+        }
+
+        let archive_record = DetectionRecord {
+            path: PathBuf::from("sample.zip!/payload.bin"),
+            score: 90,
+            verdict: Verdict::Malicious,
+            findings: [None; MAX_FINDINGS_PER_FILE],
+            surface: DetectionSurface::ArchiveEntry,
+        };
+        let filesystem_record = DetectionRecord {
+            path: PathBuf::from("payload.bin"),
+            score: 90,
+            verdict: Verdict::Malicious,
+            findings: [None; MAX_FINDINGS_PER_FILE],
+            surface: DetectionSurface::FileSystemFile,
+        };
+
+        assert!(archive_record.is_archive_path());
+        assert!(!archive_record.is_filesystem_path());
+        assert!(!filesystem_record.is_archive_path());
+        assert!(filesystem_record.is_filesystem_path());
+    }
+
+    #[test]
+    fn detection_record_display_includes_verdict_path_score_and_findings() {
+        let mut findings = [None; MAX_FINDINGS_PER_FILE];
+        findings[0] = Some(Finding {
+            id: FindingId::KnownHash,
+            score: 100,
+            confidence: Confidence::High,
+        });
+        let record = DetectionRecord {
+            path: PathBuf::from("payload.bin"),
+            score: 100,
+            verdict: Verdict::Malicious,
+            findings,
+            surface: DetectionSurface::FileSystemFile,
+        };
+
+        let rendered = record.to_string();
+
+        assert!(rendered.contains("[malicious] payload.bin"));
+        assert!(rendered.contains("score: 100"));
+        assert!(rendered.contains("known hash"));
+        assert!(rendered.contains("confidence high"));
     }
 
     #[test]
@@ -1921,6 +2064,29 @@ mod tests {
     }
 
     #[test]
+    fn scan_gzip_reader_increments_depth_for_decompressed_archive() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let nested = gzip_bytes(&zip_bytes(&[("payload.bin", b"payload")]));
+
+        scan_gzip_reader(
+            std::io::Cursor::new(nested),
+            Path::new("nested.zip.gz"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            MAX_ALLOWED_RECURSION - 1,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveDepth), 1);
+    }
+
+    #[test]
     fn decompress_gzip_limited_rejects_payloads_over_limit() {
         let err =
             decompress_gzip_limited(std::io::Cursor::new(gzip_bytes(b"abcdef")), 5).unwrap_err();
@@ -1972,6 +2138,72 @@ mod tests {
 
         assert_eq!(summary.archives_scanned, 0);
         assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveDepth), 1);
+    }
+
+    #[test]
+    fn scan_zip_archive_applies_decompressed_size_boundary() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let archive = zip_bytes_with_zero_file("limit.bin", MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE);
+
+        scan_zip_archive(
+            std::io::Cursor::new(archive),
+            Path::new("limit.zip"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert_eq!(summary.skip_count(SkipReason::MaxDecompressedBytes), 0);
+
+        let archive =
+            zip_bytes_with_zero_file("oversized.bin", MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE + 1);
+        let mut summary = ScanSummaryStats::new();
+
+        scan_zip_archive(
+            std::io::Cursor::new(archive),
+            Path::new("oversized.zip"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 0);
+        assert_eq!(summary.skip_count(SkipReason::MaxDecompressedBytes), 1);
+    }
+
+    #[test]
+    fn scan_zip_archive_increments_depth_for_nested_archive() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let payload: Vec<u8> = (0..=255).cycle().take(1024).collect();
+        let nested = gzip_bytes(&payload);
+        let archive = zip_bytes(&[("nested.gz", &nested)]);
+
+        scan_zip_archive(
+            std::io::Cursor::new(archive),
+            Path::new("outer.zip"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            MAX_ALLOWED_RECURSION - 1,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 1);
         assert_eq!(summary.skip_count(SkipReason::MaxArchiveDepth), 1);
     }
 
@@ -2066,6 +2298,54 @@ mod tests {
         assert_eq!(summary.files_skipped, 1);
         assert_eq!(summary.skip_count(SkipReason::MaxDecompressedBytes), 1);
         assert_eq!(summary.archive_entries_scanned, 0);
+    }
+
+    #[test]
+    fn scan_tar_archive_applies_decompressed_size_boundary() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let archive = tar_header_declaring_size("limit.bin", MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE);
+
+        scan_tar_archive(
+            std::io::Cursor::new(archive),
+            Path::new("limit.tar"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.skip_count(SkipReason::MaxDecompressedBytes), 0);
+        assert_eq!(summary.errors, 1);
+    }
+
+    #[test]
+    fn scan_tar_archive_increments_depth_for_nested_archive() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let payload: Vec<u8> = (0..=255).cycle().take(1024).collect();
+        let nested = gzip_bytes(&payload);
+        let archive = tar_bytes(&[("nested.gz", &nested)]);
+
+        scan_tar_archive(
+            std::io::Cursor::new(archive),
+            Path::new("outer.tar"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            MAX_ALLOWED_RECURSION - 1,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveDepth), 1);
     }
 
     #[test]

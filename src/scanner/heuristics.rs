@@ -204,4 +204,70 @@ mod tests {
         assert_eq!(Verdict::LikelyMalicious.label(), "likely malicious");
         assert_eq!(Verdict::LikelyMalicious.json_label(), "likely_malicious");
     }
+
+    #[test]
+    fn confidence_labels_are_stable() {
+        let cases = [
+            (Confidence::Low, "low", "low"),
+            (Confidence::Medium, "medium", "medium"),
+            (Confidence::High, "high", "high"),
+        ];
+
+        for (confidence, label, json_label) in cases {
+            assert_eq!(confidence.label(), label);
+            assert_eq!(confidence.json_label(), json_label);
+        }
+    }
+
+    #[test]
+    fn finding_id_labels_are_stable() {
+        let cases = [
+            (FindingId::KnownHash, "known hash", "known_hash"),
+            (
+                FindingId::SingleYaraRule,
+                "single YARA rule match",
+                "single_yara_rule_match",
+            ),
+            (
+                FindingId::MultipleYaraRules,
+                "multiple YARA rule match",
+                "multiple_yara_rule_match",
+            ),
+            (
+                FindingId::YaraPersistenceIndicator,
+                "persistence indicator",
+                "persistence_indicator",
+            ),
+            (
+                FindingId::YaraRootkitIndicator,
+                "rootkit indicator",
+                "rootkit_indicator",
+            ),
+            (
+                FindingId::YaraPackerIndicator,
+                "packer indicator",
+                "packer_indicator",
+            ),
+            (
+                FindingId::StaticLdPreloadReference,
+                "static LRD preload reference",
+                "static_lrd_preload_reference",
+            ),
+            (
+                FindingId::ElfWritableExecutableSegment,
+                "writable executable segement",
+                "writable_executable_segement",
+            ),
+            (
+                FindingId::RuntimeMemfdExec,
+                "runtime memfd exec",
+                "runtime_memfd_exec",
+            ),
+        ];
+
+        for (finding, label, json_label) in cases {
+            assert_eq!(finding.label(), label);
+            assert_eq!(finding.json_label(), json_label);
+        }
+    }
 }

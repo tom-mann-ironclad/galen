@@ -259,8 +259,45 @@ mod tests {
         assert_eq!(report.visible_detections[0].path, "sample.zip!/payload");
         assert_eq!(report.suppressed_detections[0].path, "sample.zip");
         assert_eq!(report.summary.skips[0].reason, "zero_size");
+        assert_eq!(
+            report
+                .summary
+                .raw_detections_by_surface
+                .iter()
+                .map(|item| (item.surface.as_str(), item.count))
+                .collect::<Vec<_>>(),
+            vec![("archive_entry", 1), ("archive_container", 1)]
+        );
+        assert_eq!(report.visible_detections[0].surface, "archive_entry");
+        assert_eq!(report.visible_detections[0].findings[0].id, "known_hash");
+        assert_eq!(report.visible_detections[0].findings[0].confidence, "high");
         assert_eq!(report.summary.scan_time_ms, 25.0);
         assert_eq!(report.yara.rules_triggered[0].rule, "a_rule");
         assert_eq!(report.yara.rules_triggered[1].rule, "z_rule");
+    }
+
+    #[test]
+    fn scan_report_omits_zero_count_skips_and_surfaces() {
+        let mut summary = ScanSummaryStats::new();
+        summary.filesystem_files_scanned = 1;
+        summary.detections = vec![detection(
+            "payload.bin",
+            DetectionSurface::FileSystemFile,
+            90,
+        )];
+
+        let report = ScanReport::from_summary(&summary, Duration::from_millis(1));
+
+        assert!(report.summary.skips.is_empty());
+        assert_eq!(report.summary.raw_detection_records, 1);
+        assert_eq!(report.summary.visible_detection_records, 1);
+        assert_eq!(report.summary.suppressed_detection_records, 0);
+        assert_eq!(report.summary.raw_detections_by_surface.len(), 1);
+        assert_eq!(
+            report.summary.raw_detections_by_surface[0].surface,
+            "filesystem_file"
+        );
+        assert_eq!(report.summary.raw_detections_by_surface[0].count, 1);
+        assert_eq!(report.visible_detections[0].verdict, "malicious");
     }
 }

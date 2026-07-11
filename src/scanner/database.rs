@@ -70,8 +70,20 @@ mod tests {
             sha256: vec![hash(1), hash(3), hash(9)],
         };
 
+        assert!(!database.is_empty());
         assert!(database.contains(&FileHashes { sha256: hash(3) }));
         assert!(!database.contains(&FileHashes { sha256: hash(4) }));
+    }
+
+    #[test]
+    fn is_empty_reports_whether_hashes_are_loaded() {
+        assert!(HashDatabase::default().is_empty());
+        assert!(
+            !HashDatabase {
+                sha256: vec![hash(1)]
+            }
+            .is_empty()
+        );
     }
 
     #[test]

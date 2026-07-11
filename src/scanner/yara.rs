@@ -234,6 +234,111 @@ mod tests {
     }
 
     #[test]
+    fn classify_yara_rule_recognizes_each_hint_source_independently() {
+        let cases = [
+            (
+                "credential_from_identifier",
+                "browser_password_stealer",
+                vec![],
+                vec![],
+                YaraRuleClass::CredentialAccess,
+            ),
+            (
+                "credential_from_tag",
+                "generic_rule",
+                vec!["keylogger"],
+                vec![],
+                YaraRuleClass::CredentialAccess,
+            ),
+            (
+                "credential_from_metadata_key",
+                "generic_rule",
+                vec![],
+                vec!["credential_family"],
+                YaraRuleClass::CredentialAccess,
+            ),
+            (
+                "persistence_from_identifier",
+                "systemd_service_dropper",
+                vec![],
+                vec![],
+                YaraRuleClass::Persistence,
+            ),
+            (
+                "persistence_from_tag",
+                "generic_rule",
+                vec!["cron"],
+                vec![],
+                YaraRuleClass::Persistence,
+            ),
+            (
+                "packer_from_identifier",
+                "upx_packed_binary",
+                vec![],
+                vec![],
+                YaraRuleClass::PackerOrObfuscation,
+            ),
+            (
+                "packer_from_tag",
+                "generic_rule",
+                vec!["cryptor"],
+                vec![],
+                YaraRuleClass::PackerOrObfuscation,
+            ),
+            (
+                "eicar_from_identifier",
+                "EICAR_Test_File",
+                vec![],
+                vec![],
+                YaraRuleClass::EICAR,
+            ),
+            (
+                "eicar_from_tag",
+                "generic_rule",
+                vec!["eicar"],
+                vec![],
+                YaraRuleClass::EICAR,
+            ),
+            (
+                "eicar_from_metadata_key",
+                "generic_rule",
+                vec![],
+                vec!["EICAR"],
+                YaraRuleClass::EICAR,
+            ),
+            (
+                "amtso_from_identifier",
+                "AMTSO_Test_File",
+                vec![],
+                vec![],
+                YaraRuleClass::AMTSO,
+            ),
+            (
+                "amtso_from_tag",
+                "generic_rule",
+                vec!["amtso"],
+                vec![],
+                YaraRuleClass::AMTSO,
+            ),
+            (
+                "amtso_from_metadata_key",
+                "generic_rule",
+                vec![],
+                vec!["AMTSO"],
+                YaraRuleClass::AMTSO,
+            ),
+        ];
+
+        for (name, identifier, tags, metadata_keys, expected) in cases {
+            let class = classify_yara_rule(identifier, tags, metadata_keys);
+            assert!(
+                std::mem::discriminant(&class) == std::mem::discriminant(&expected),
+                "{name}: got {class:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn infer_persistence_strength_increases_when_multiple_primitives_are_seen() {
         assert!(matches!(
             infer_persistence_strength("cron_rule", std::iter::empty()),
@@ -241,6 +346,33 @@ mod tests {
         ));
         assert!(matches!(
             infer_persistence_strength("cron_rule", ["systemd"]),
+            RuleStrength::CombinedSuspiciousPrimitives
+        ));
+    }
+
+    #[test]
+    fn infer_persistence_strength_counts_each_primitive_once() {
+        for identifier in [
+            "ld_preload_rule",
+            "cron_rule",
+            "systemctl_rule",
+            "bashrc_rule",
+        ] {
+            assert!(
+                matches!(
+                    infer_persistence_strength(identifier, std::iter::empty()),
+                    RuleStrength::GenericPrimitive
+                ),
+                "{identifier}"
+            );
+        }
+
+        assert!(matches!(
+            infer_persistence_strength("ldpreload_rule", ["cron"]),
+            RuleStrength::CombinedSuspiciousPrimitives
+        ));
+        assert!(matches!(
+            infer_persistence_strength("systemd_rule", ["profile"]),
             RuleStrength::CombinedSuspiciousPrimitives
         ));
     }

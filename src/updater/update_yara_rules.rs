@@ -141,4 +141,43 @@ mod tests {
         assert_eq!(paths[0], root.path().join("b.yar"));
         assert_eq!(paths[1], nested.join("a.yara"));
     }
+
+    #[test]
+    fn update_yara_rules_compiles_supported_rule_files() {
+        let root = tempfile::tempdir().unwrap();
+        let cache_path = root.path().join("cache").join("rules.yaraxc");
+        let rules_dir = root.path().join("rules");
+        std::fs::create_dir(&rules_dir).unwrap();
+        std::fs::File::create(rules_dir.join("one.yar"))
+            .unwrap()
+            .write_all(b"rule one { condition: true }")
+            .unwrap();
+        std::fs::File::create(rules_dir.join("two.yara"))
+            .unwrap()
+            .write_all(b"rule two { condition: true }")
+            .unwrap();
+        std::fs::File::create(rules_dir.join("ignored.txt"))
+            .unwrap()
+            .write_all(b"rule ignored { condition: true }")
+            .unwrap();
+
+        let compiled = update_yara_rules(&rules_dir, &cache_path).unwrap();
+
+        assert_eq!(compiled, 2);
+        assert!(cache_path.is_file());
+        assert!(!cache_path.with_extension("yaraxc.tmp").exists());
+    }
+
+    #[test]
+    fn update_yara_rules_rejects_empty_rule_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let rules_dir = root.path().join("rules");
+        let cache_path = root.path().join("rules.yaraxc");
+        std::fs::create_dir(&rules_dir).unwrap();
+
+        let err = update_yara_rules(&rules_dir, &cache_path).unwrap_err();
+
+        assert!(err.contains("No rules found in directory"));
+        assert!(!cache_path.exists());
+    }
 }

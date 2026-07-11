@@ -197,7 +197,7 @@ Galen should not currently be treated as a production anti-malware replacement.
 
 Known limitations include:
 
-* Test coverage is still incomplete
+* Test coverage is still incomplete (~68% code coverage with a ~69% mutation coverage)
 * JSON schema versioning is not fully documented yet
 * Configuration support is still limited
 * No packaged `.deb` or `.rpm` release yet
