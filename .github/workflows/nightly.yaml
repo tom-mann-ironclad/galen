@@ -37,13 +37,16 @@ jobs:
         run: |
           mkdir -p dist/apt dist/dnf
           
-          # Generate a SemVer-compliant dynamic version string
+          # Generate nightly versions for Cargo and distro package managers.
           BASE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          NIGHTLY_VERSION="${BASE_VERSION}-nightly.$(date -u +%Y%m%d)"
-          echo "Injecting Nightly Version: $NIGHTLY_VERSION"
+          NIGHTLY_DATE="$(date -u +%Y%m%d)"
+          CARGO_NIGHTLY_VERSION="${BASE_VERSION}+nightly.${NIGHTLY_DATE}"
+          PACKAGE_NIGHTLY_VERSION="${BASE_VERSION}~nightly.${NIGHTLY_DATE}"
+          echo "Injecting Cargo Nightly Version: $CARGO_NIGHTLY_VERSION"
+          echo "Injecting Package Nightly Version: $PACKAGE_NIGHTLY_VERSION"
           
           # Update Cargo.toml inline before compiling
-          sed -i "0,/version = \".*\"/{s/version = \".*\"/version = \"$NIGHTLY_VERSION\"/}" Cargo.toml
+          sed -i "0,/version = \".*\"/{s/version = \".*\"/version = \"$CARGO_NIGHTLY_VERSION\"/}" Cargo.toml
           
           # 1. Compile production binary
           cargo build --release
@@ -52,10 +55,12 @@ jobs:
           strip -s target/release/galen
           
           # 3. Generate the Debian package (.deb)
-          cargo deb --no-build -o dist/apt/
+          cargo deb --no-build --deb-version "${PACKAGE_NIGHTLY_VERSION}-1" -o dist/apt/
           
           # 4. Generate the RedHat package (.rpm)
-          cargo generate-rpm -o dist/dnf/
+          RPM_METADATA="$(mktemp)"
+          printf 'version = "%s"\nrelease = "1"\n' "$PACKAGE_NIGHTLY_VERSION" > "$RPM_METADATA"
+          cargo generate-rpm -o dist/dnf/ --metadata-overwrite="$RPM_METADATA"
 
       - name: Generate APT Repo Metadata
         run: |
