@@ -16,7 +16,7 @@ Implemented so far:
 * YARA scanning using a precompiled rules cache
 * Heuristic scoring and verdicts
 * Recursive directory scanning
-* ZIP archive scanning
+* ZIP/JAR archive scanning
 * TAR, GZ, and TGZ archive scanning
 * Archive recursion and decompression limits to reduce archive bomb risk
 * Magic-byte archive detection
@@ -32,7 +32,7 @@ Still in progress:
 * Custom error types
 * Configurable scan limits
 * CI/CD
-* Packaging
+* Packaging - nightly releases are available via APT and DNF, but no stable releases or AUR support at this time.
 * build assurance
 * Broader clean and malicious corpus testing
 * More mature operator documentation
@@ -88,6 +88,44 @@ Galen tracks detections inside archives using virtual paths such as:
 ```
 
 This makes it easier to understand whether a detection came from a filesystem file, an archive entry, or the archive container itself.
+
+## Installation
+
+Only a `nightly` version of Galen is currently packaged. It is available on APT and DNF.
+
+For APT users:
+
+```
+# 1. Create the keyrings directory if it doesn't exist
+sudo mkdir -p /etc/apt/keyrings
+
+# 2. Download the public key safely into that directory
+sudo curl -fsSL https://packages.ironclad-software.com/packages.gpg -o /etc/apt/keyrings/galen.gpg
+
+# 3. Add the repository configuration file, tightly scoped to that key
+echo "deb [signed-by=/etc/apt/keyrings/galen.gpg] https://packages.ironclad-software.com/nightly/apt /" | sudo tee /etc/apt/sources.list.d/galen.list
+
+# 4. Update and install
+sudo apt update
+sudo apt install galen
+```
+
+For DNF users:
+
+Add the configuration for the repository:
+
+```
+sudo tee /etc/yum.repos.d/galen.repo << 'EOF'
+[galen-nightly]
+name=Galen Nightly Repository
+baseurl=https://packages.ironclad-software.com/nightly/dnf/
+enabled=1
+gpgcheck=1
+gpgkey=https://packages.ironclad-software.com/packages.gpg
+EOF
+```
+
+Then install with `dnf install galen`.
 
 ## Design Goals
 
@@ -197,10 +235,10 @@ Galen should not currently be treated as a production anti-malware replacement.
 
 Known limitations include:
 
-* Test coverage is still incomplete (~68% code coverage with a ~69% mutation coverage)
+* Test coverage is still incomplete (~75.1% code coverage with a ~74.6% mutation coverage)
 * JSON schema versioning is not fully documented yet
 * Configuration support is still limited
-* No packaged `.deb` or `.rpm` release yet
+* No packaged `.deb` or `.rpm` release yet (although nightly is available)
 * Limited CI/CD pipeline
 * Detection quality is still being calibrated
 * Archive handling needs more regression tests
@@ -236,7 +274,6 @@ Later priorities:
 * ELF analysis
 * Additional confidence calibration against clean, suspicious, and malicious corpora
 * `.deb` and `.rpm` packaging
-* SBOM generation
 * Performance experiments with parallel scanning
 
 ## Example Usage

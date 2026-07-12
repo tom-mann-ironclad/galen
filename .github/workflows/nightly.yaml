@@ -1,0 +1,103 @@
+name: Update Nightly Package Repositories
+
+on:
+  schedule:
+    # Runs at 00:00 UTC every day (Midnight)
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Keeps the "Run workflow" button in GitHub UI for manual testing
+
+# Concurrency is still useful here in case a manual run overlaps with the scheduled run
+concurrency:
+  group: nightly-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy-nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Install Repo Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils createrepo-c
+          cargo install -y cargo-deb cargo-generate-rpm
+
+      - name: Import GPG Key
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          export_default: true
+
+      # Generate unique pre-release version string using current UTC date
+      - name: Build Nightly Packages
+        run: |
+          mkdir -p dist/apt dist/dnf
+          
+          # Generate a SemVer-compliant dynamic version string
+          BASE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          NIGHTLY_VERSION="${BASE_VERSION}-nightly.$(date -u +%Y%m%d)"
+          echo "Injecting Nightly Version: $NIGHTLY_VERSION"
+          
+          # Update Cargo.toml inline before compiling
+          sed -i "0,/version = \".*\"/{s/version = \".*\"/version = \"$NIGHTLY_VERSION\"/}" Cargo.toml
+          
+          # 1. Compile production binary
+          cargo build --release
+          
+          # 2. Strip debug symbols to dramatically minimize binary size
+          strip -s target/release/galen
+          
+          # 3. Generate the Debian package (.deb)
+          cargo deb --no-build -o dist/apt/
+          
+          # 4. Generate the RedHat package (.rpm)
+          cargo generate-rpm -o dist/dnf/
+
+      - name: Generate APT Repo Metadata
+        run: |
+          cd dist/apt
+          dpkg-scanpackages . /dev/null > Packages
+          gzip -9fk Packages
+          apt-ftparchive release . > Release
+          echo "${{ secrets.GPG_PASSPHRASE }}" | gpg --batch --yes --passphrase-fd 0 --clearsign --local-user "${{ steps.import-gpg.outputs.keyid }}" -o InRelease Release
+          echo "${{ secrets.GPG_PASSPHRASE }}" | gpg --batch --yes --passphrase-fd 0 --detach-sign --local-user "${{ steps.import-gpg.outputs.keyid }}" -o Release.gpg Release
+
+      - name: Generate DNF Repo Metadata
+        run: |
+          cd dist/dnf
+          createrepo_c .
+          echo "${{ secrets.GPG_PASSPHRASE }}" | gpg --batch --yes --passphrase-fd 0 --detach-sign --local-user "${{ steps.import-gpg.outputs.keyid }}" --armor repodata/repomd.xml
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # Sync to the 'nightly/' path. Note the '--delete' flag on both passes 
+      # to ensure yesterday's packages are dropped.
+      - name: Sync Nightly to Cloudflare R2
+        env:
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET_NAME: galen-packages
+        run: |
+          # Step A: Sync immutable binaries (deletes historical nightlies)
+          aws s3 sync dist/ $R2_ENDPOINT/$BUCKET_NAME/nightly/ \
+            --endpoint-url $R2_ENDPOINT \
+            --exclude "*" \
+            --include "*.deb" \
+            --include "*.rpm" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --delete
+
+          # Step B: Sync volatile metadata (forces no-cache)
+          aws s3 sync dist/ $R2_ENDPOINT/$BUCKET_NAME/nightly/ \
+            --endpoint-url $R2_ENDPOINT \
+            --exclude "*.deb" \
+            --exclude "*.rpm" \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --delete

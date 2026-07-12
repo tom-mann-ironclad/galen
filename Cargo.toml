@@ -12,6 +12,22 @@ categories = ["command-line-utilities"]
 publish = false
 rust-version = "1.95.0"
 
+# --- Debian Packaging Configuration ---
+[package.metadata.deb]
+maintainer = "Galen <packages@ironclad-software.com>"
+copyright = "2026 Tom Mann"
+license-file = ["LICENSE"]
+assets = [
+    # [Source Path, Target Destination, Permissions]
+    ["target/release/galen", "usr/bin/galen", "755"],
+]
+
+# --- RPM Packaging Configuration ---
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/galen", dest = "/usr/bin/galen", mode = "0755" }
+]
+
 [dependencies]
 chrono = "0.4.45"
 flate2 = "1.1.9"
