@@ -30,7 +30,6 @@ jobs:
         with:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
           passphrase: ${{ secrets.GPG_PASSPHRASE }}
-          export_default: true
 
       # Generate unique pre-release version string using current UTC date
       - name: Build Nightly Packages
@@ -77,22 +76,18 @@ jobs:
           createrepo_c .
           echo "${{ secrets.GPG_PASSPHRASE }}" | gpg --batch --yes --passphrase-fd 0 --detach-sign --local-user "${{ steps.import-gpg.outputs.keyid }}" --armor repodata/repomd.xml
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-
       # Sync to the 'nightly/' path. Note the '--delete' flag on both passes 
       # to ensure yesterday's packages are dropped.
       - name: Sync Nightly to Cloudflare R2
         env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET_NAME: galen-packages
         run: |
           # Step A: Sync immutable binaries (deletes historical nightlies)
-          aws s3 sync dist/ $R2_ENDPOINT/$BUCKET_NAME/nightly/ \
+          aws s3 sync dist/ s3://$BUCKET_NAME/nightly/ \
             --endpoint-url $R2_ENDPOINT \
             --exclude "*" \
             --include "*.deb" \
@@ -101,7 +96,7 @@ jobs:
             --delete
 
           # Step B: Sync volatile metadata (forces no-cache)
-          aws s3 sync dist/ $R2_ENDPOINT/$BUCKET_NAME/nightly/ \
+          aws s3 sync dist/ s3://$BUCKET_NAME/nightly/ \
             --endpoint-url $R2_ENDPOINT \
             --exclude "*.deb" \
             --exclude "*.rpm" \
