@@ -16,7 +16,7 @@ rust-version = "1.95.0"
 [package.metadata.deb]
 maintainer = "Galen <packages@ironclad-software.com>"
 copyright = "2026 Tom Mann"
-license-file = ["LICENSE"]
+license-file = ["LICENSE.md"]
 assets = [
     # [Source Path, Target Destination, Permissions]
     ["target/release/galen", "usr/bin/galen", "755"],
