@@ -22,9 +22,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y apt-utils createrepo-c
-          cargo install -y cargo-deb cargo-generate-rpm
+          cargo install cargo-deb cargo-generate-rpm
 
       - name: Import GPG Key
+        id: import-gpg
         uses: crazy-max/ghaction-import-gpg@v7
         with:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
