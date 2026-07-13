@@ -180,4 +180,21 @@ mod tests {
         assert!(err.contains("No rules found in directory"));
         assert!(!cache_path.exists());
     }
+
+    #[test]
+    fn update_yara_rules_reports_invalid_rule_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let rules_dir = root.path().join("rules");
+        let cache_path = root.path().join("rules.yaraxc");
+        std::fs::create_dir(&rules_dir).unwrap();
+        std::fs::File::create(rules_dir.join("bad.yar"))
+            .unwrap()
+            .write_all(b"rule broken { condition: }")
+            .unwrap();
+
+        let err = update_yara_rules(&rules_dir, &cache_path).unwrap_err();
+
+        assert!(err.contains("Unable to add rules"));
+        assert!(!cache_path.exists());
+    }
 }

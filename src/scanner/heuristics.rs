@@ -201,8 +201,22 @@ mod tests {
 
     #[test]
     fn labels_are_distinct_for_human_and_json_verdicts() {
-        assert_eq!(Verdict::LikelyMalicious.label(), "likely malicious");
-        assert_eq!(Verdict::LikelyMalicious.json_label(), "likely_malicious");
+        let cases = [
+            (Verdict::Clean, "clean", "clean"),
+            (Verdict::Informational, "informational", "informational"),
+            (Verdict::Suspicious, "suspicious", "suspicious"),
+            (
+                Verdict::LikelyMalicious,
+                "likely malicious",
+                "likely_malicious",
+            ),
+            (Verdict::Malicious, "malicious", "malicious"),
+        ];
+
+        for (verdict, label, json_label) in cases {
+            assert_eq!(verdict.label(), label);
+            assert_eq!(verdict.json_label(), json_label);
+        }
     }
 
     #[test]

@@ -12,6 +12,9 @@ categories = ["command-line-utilities"]
 publish = false
 rust-version = "1.95.0"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
+
 # --- Debian Packaging Configuration ---
 [package.metadata.deb]
 maintainer = "Galen <packages@ironclad-software.com>"

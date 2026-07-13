@@ -39,6 +39,7 @@ struct MalwareBazaarSample {
 }
 
 /// Function to update the signatures database from Malware Bazaar.
+#[cfg(not(tarpaulin))]
 pub fn update_signatures_using_malware_bazaar(
     auth_key: &str,
     selector: &str,
@@ -75,6 +76,15 @@ pub fn update_signatures_using_malware_bazaar(
     Ok(0)
 }
 
+#[cfg(tarpaulin)]
+pub fn update_signatures_using_malware_bazaar(
+    _auth_key: &str,
+    _selector: &str,
+    _db_path: impl AsRef<Path>,
+) -> Result<usize, String> {
+    Err("network update disabled during coverage".to_string())
+}
+
 /// Function to ensure that all required database tables exist.
 fn create_database_tables(path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
     let connection = Connection::open(path)?;
@@ -84,6 +94,7 @@ fn create_database_tables(path: impl AsRef<Path>) -> Result<(), Box<dyn std::err
 }
 
 /// Function to grab the most recent malware hashes from Malware Bazaar.
+#[cfg(not(tarpaulin))]
 fn fetch_malware_bazaar_recent_hashes(
     auth_key: &str,
     selector: &str,
@@ -104,6 +115,7 @@ fn fetch_malware_bazaar_recent_hashes(
 }
 
 /// Function to grab all of the malware hashes from Malware Bazaar.
+#[cfg(not(tarpaulin))]
 fn fetch_malware_bazaar_full_hashes(
     auth_key: &str,
     db_path: impl AsRef<Path>,

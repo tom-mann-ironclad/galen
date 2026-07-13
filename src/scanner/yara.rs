@@ -212,6 +212,25 @@ pub fn score_matched_rule(class: &YaraRuleClass, strength: &RuleStrength) -> (u1
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufWriter;
+
+    fn compile_rules(source: &str) -> Rules {
+        let mut compiler = yara_x::Compiler::new();
+        compiler.add_source(source).unwrap();
+        compiler.build()
+    }
+
+    #[test]
+    fn load_yara_rules_cache_reads_serialized_rules_and_reports_missing_files() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let rules = compile_rules("rule always_matches { condition: true }");
+        rules.serialize_into(BufWriter::new(&file)).unwrap();
+
+        let loaded = load_yara_rules_cache(file.path()).unwrap();
+
+        assert_eq!(loaded.iter().len(), 1);
+        assert!(load_yara_rules_cache(file.path().with_extension("missing")).is_err());
+    }
 
     #[test]
     fn classify_yara_rule_uses_identifier_tags_and_metadata_hints() {
@@ -339,6 +358,22 @@ mod tests {
     }
 
     #[test]
+    fn classify_yara_rule_exercises_combined_tag_and_metadata_updates() {
+        assert!(matches!(
+            classify_yara_rule(
+                "generic_rule",
+                ["persistence", "eicar", "amtso", "cryptor", "password"],
+                ["credential", "EICAR", "AMTSO"]
+            ),
+            YaraRuleClass::CredentialAccess
+        ));
+        assert!(matches!(
+            classify_yara_rule("generic_rule", std::iter::empty(), std::iter::empty()),
+            YaraRuleClass::Unknown
+        ));
+    }
+
+    #[test]
     fn infer_persistence_strength_increases_when_multiple_primitives_are_seen() {
         assert!(matches!(
             infer_persistence_strength("cron_rule", std::iter::empty()),
@@ -375,6 +410,10 @@ mod tests {
             infer_persistence_strength("systemd_rule", ["profile"]),
             RuleStrength::CombinedSuspiciousPrimitives
         ));
+        assert!(matches!(
+            infer_persistence_strength("generic_rule", ["autostart"]),
+            RuleStrength::GenericPrimitive
+        ));
     }
 
     #[test]
@@ -385,10 +424,35 @@ mod tests {
         );
         assert_eq!(
             score_matched_rule(
+                &YaraRuleClass::Unknown,
+                &RuleStrength::HighConfidenceMalware
+            ),
+            (75, Confidence::High)
+        );
+        assert_eq!(
+            score_matched_rule(
+                &YaraRuleClass::MalwareFamily,
+                &RuleStrength::MalwareSpecific
+            ),
+            (60, Confidence::High)
+        );
+        assert_eq!(
+            score_matched_rule(
+                &YaraRuleClass::Persistence,
+                &RuleStrength::ConcreteTechnique
+            ),
+            (35, Confidence::Medium)
+        );
+        assert_eq!(
+            score_matched_rule(
                 &YaraRuleClass::Persistence,
                 &RuleStrength::CombinedSuspiciousPrimitives
             ),
             (20, Confidence::Low)
+        );
+        assert_eq!(
+            score_matched_rule(&YaraRuleClass::Persistence, &RuleStrength::GenericPrimitive),
+            (10, Confidence::Low)
         );
         assert_eq!(
             score_matched_rule(
@@ -396,6 +460,31 @@ mod tests {
                 &RuleStrength::ConcreteTechnique
             ),
             (45, Confidence::Medium)
+        );
+        assert_eq!(
+            score_matched_rule(
+                &YaraRuleClass::CredentialAccess,
+                &RuleStrength::GenericPrimitive
+            ),
+            (15, Confidence::Low)
+        );
+        assert_eq!(
+            score_matched_rule(
+                &YaraRuleClass::PackerOrObfuscation,
+                &RuleStrength::GenericPrimitive
+            ),
+            (5, Confidence::Low)
+        );
+        assert_eq!(
+            score_matched_rule(&YaraRuleClass::Unknown, &RuleStrength::GenericPrimitive),
+            (5, Confidence::Low)
+        );
+        assert_eq!(
+            score_matched_rule(
+                &YaraRuleClass::DefenseEvasion,
+                &RuleStrength::ConcreteTechnique
+            ),
+            (10, Confidence::Low)
         );
     }
 }

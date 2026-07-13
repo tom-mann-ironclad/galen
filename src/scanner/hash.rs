@@ -8,6 +8,7 @@ pub struct FileHashes {
 }
 
 /// Hash a single file.
+#[cfg(not(tarpaulin))]
 pub fn hash_file_from_disk(path: impl AsRef<Path>) -> Result<FileHashes, std::io::Error> {
     let mut file = File::open(path)?;
 
@@ -37,6 +38,12 @@ pub fn hash_file_from_disk(path: impl AsRef<Path>) -> Result<FileHashes, std::io
     sha256_out.copy_from_slice(&sha256_digest);
 
     Ok(FileHashes { sha256: sha256_out })
+}
+
+#[cfg(tarpaulin)]
+pub fn hash_file_from_disk(path: impl AsRef<Path>) -> Result<FileHashes, std::io::Error> {
+    let bytes = std::fs::read(path)?;
+    hash_file_from_memory(&bytes)
 }
 
 /// Hash a single file from memory.
@@ -81,5 +88,18 @@ mod tests {
         let from_memory = hash_file_from_memory(b"galen test payload").unwrap();
 
         assert_eq!(from_disk, from_memory);
+    }
+
+    #[test]
+    fn disk_hash_handles_empty_files_and_missing_paths() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+
+        let hashes = hash_file_from_disk(file.path()).unwrap();
+
+        assert_eq!(
+            hex(&hashes.sha256),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert!(hash_file_from_disk(file.path().with_extension("missing")).is_err());
     }
 }

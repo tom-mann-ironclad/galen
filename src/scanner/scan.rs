@@ -12,10 +12,67 @@ use std::path::{Component, Path, PathBuf};
 
 const MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE: u64 = 64 * 1024 * 1024;
 const RETAINED_ENTRY_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
-// depth 0 = top-level archive
-// depth 1 = archive inside archive
-// depth 2 = archive inside archive inside archive, rejected
 const MAX_ALLOWED_RECURSION: usize = 5;
+const MAX_ALLOWED_ARCHIVE_ENTRIES: usize = 10000;
+
+#[derive(Debug, Default)]
+/// Tracks safety limits that must be shared while scanning one archive tree.
+struct ArchiveScanState {
+    /// Cumulative member count for the current top-level archive scan.
+    entries_seen: usize,
+    /// Current nested archive depth for the active path being scanned.
+    depth: usize,
+}
+
+impl ArchiveScanState {
+    /// Start a fresh archive scan state at the caller's current depth.
+    fn new(depth: usize) -> Self {
+        Self {
+            entries_seen: 0,
+            depth,
+        }
+    }
+
+    /// Descend into an archive member that may itself contain an archive.
+    fn enter_child(&mut self) {
+        self.depth += 1;
+    }
+
+    /// Return from a nested archive member so sibling entries keep the same depth.
+    fn leave_child(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    /// Check whether another archive may be opened at the current path depth.
+    fn allow_archive(&self, summary: &mut ScanSummaryStats, archive_path: &Path) -> bool {
+        if self.depth >= MAX_ALLOWED_RECURSION {
+            summary.record_skip(SkipReason::MaxArchiveDepth);
+            eprintln!(
+                "Skipped archive: maximum recursion reached: {}",
+                archive_path.display()
+            );
+            return false;
+        }
+
+        true
+    }
+
+    /// Record one archive member and report whether the tree entry limit still allows scanning.
+    fn record_entry(&mut self, summary: &mut ScanSummaryStats, archive_path: &Path) -> bool {
+        self.entries_seen += 1;
+
+        if self.entries_seen > MAX_ALLOWED_ARCHIVE_ENTRIES {
+            summary.record_skip(SkipReason::MaxArchiveEntries);
+            eprintln!(
+                "Skipped archive: maximum archive entries reached: {}",
+                archive_path.display()
+            );
+            return false;
+        }
+
+        true
+    }
+}
 
 #[derive(Debug, Default)]
 /// The stats from scanning a given file/directory path.
@@ -696,13 +753,13 @@ fn read_limited_into<R: Read>(
 }
 
 /// Function to scan a file held in memory, and not on disk.
-fn scan_bytes(
+fn scan_bytes_with_state(
     virtual_path: &Path,
     bytes: &[u8],
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
-    depth: usize,
+    archive_state: &mut ArchiveScanState,
 ) -> Result<(), String> {
     let mut heuristics = HeuristicAccumulator::new();
     let mut surface = DetectionSurface::ArchiveEntry;
@@ -755,13 +812,13 @@ fn scan_bytes(
             ArchiveKind::Zip => {
                 let cursor = Cursor::new(bytes);
 
-                if let Err(err) = scan_zip_archive(
+                if let Err(err) = scan_zip_archive_with_state(
                     cursor,
                     virtual_path,
                     hash_database,
                     yara_scanner,
                     summary,
-                    depth,
+                    archive_state,
                 ) {
                     summary.errors += 1;
                     eprintln!(
@@ -775,13 +832,13 @@ fn scan_bytes(
             ArchiveKind::Tar => {
                 let cursor = Cursor::new(bytes);
 
-                if let Err(err) = scan_tar_archive(
+                if let Err(err) = scan_tar_archive_with_state(
                     cursor,
                     virtual_path,
                     hash_database,
                     yara_scanner,
                     summary,
-                    depth,
+                    archive_state,
                 ) {
                     summary.errors += 1;
                     eprintln!(
@@ -795,13 +852,13 @@ fn scan_bytes(
             ArchiveKind::Gzip => {
                 let cursor = Cursor::new(bytes);
 
-                if let Err(err) = scan_gzip_reader(
+                if let Err(err) = scan_gzip_reader_with_state(
                     cursor,
                     virtual_path,
                     hash_database,
                     yara_scanner,
                     summary,
-                    depth,
+                    archive_state,
                 ) {
                     summary.errors += 1;
                     eprintln!(
@@ -882,12 +939,29 @@ fn scan_zip_archive<R>(
 where
     R: Read + std::io::Seek,
 {
-    if depth >= MAX_ALLOWED_RECURSION {
-        summary.record_skip(SkipReason::MaxArchiveDepth);
-        eprintln!(
-            "Skipped archive: maximum recursion reached: {}",
-            archive_path.display()
-        );
+    let mut archive_state = ArchiveScanState::new(depth);
+    scan_zip_archive_with_state(
+        reader,
+        archive_path,
+        hash_database,
+        yara_scanner,
+        summary,
+        &mut archive_state,
+    )
+}
+
+fn scan_zip_archive_with_state<R>(
+    reader: R,
+    archive_path: &Path,
+    hash_database: &HashDatabase,
+    yara_scanner: &mut yara_x::Scanner,
+    summary: &mut ScanSummaryStats,
+    archive_state: &mut ArchiveScanState,
+) -> Result<(), String>
+where
+    R: Read + std::io::Seek,
+{
+    if !archive_state.allow_archive(summary, archive_path) {
         return Ok(());
     }
 
@@ -909,6 +983,10 @@ where
                 continue;
             }
         };
+
+        if !archive_state.record_entry(summary, archive_path) {
+            break;
+        }
 
         if entry.is_dir() {
             continue;
@@ -945,14 +1023,16 @@ where
 
         let virtual_path = make_archive_path(archive_path, Path::new(entry.name()));
 
-        let _ = scan_bytes(
+        archive_state.enter_child();
+        let _ = scan_bytes_with_state(
             &virtual_path,
             &entry_buffer,
             hash_database,
             yara_scanner,
             summary,
-            depth + 1,
+            archive_state,
         );
+        archive_state.leave_child();
 
         if entry_buffer.capacity() > RETAINED_ENTRY_BUFFER_LIMIT {
             entry_buffer = Vec::new();
@@ -976,12 +1056,29 @@ fn scan_tar_archive<R>(
 where
     R: Read,
 {
-    if depth >= MAX_ALLOWED_RECURSION {
-        summary.record_skip(SkipReason::MaxArchiveDepth);
-        eprintln!(
-            "Skipped archive: maximum recursion reached: {}",
-            archive_path.display()
-        );
+    let mut archive_state = ArchiveScanState::new(depth);
+    scan_tar_archive_with_state(
+        reader,
+        archive_path,
+        hash_database,
+        yara_scanner,
+        summary,
+        &mut archive_state,
+    )
+}
+
+fn scan_tar_archive_with_state<R>(
+    reader: R,
+    archive_path: &Path,
+    hash_database: &HashDatabase,
+    yara_scanner: &mut yara_x::Scanner,
+    summary: &mut ScanSummaryStats,
+    archive_state: &mut ArchiveScanState,
+) -> Result<(), String>
+where
+    R: Read,
+{
+    if !archive_state.allow_archive(summary, archive_path) {
         return Ok(());
     }
 
@@ -1017,6 +1114,10 @@ where
                 continue;
             }
         };
+
+        if !archive_state.record_entry(summary, archive_path) {
+            break;
+        }
 
         let header = entry.header();
 
@@ -1062,14 +1163,16 @@ where
 
         let virtual_path = make_archive_path(archive_path, &entry_path);
 
-        let _ = scan_bytes(
+        archive_state.enter_child();
+        let _ = scan_bytes_with_state(
             &virtual_path,
             &entry_buffer,
             hash_database,
             yara_scanner,
             summary,
-            depth + 1,
+            archive_state,
         );
+        archive_state.leave_child();
 
         if entry_buffer.capacity() > RETAINED_ENTRY_BUFFER_LIMIT {
             entry_buffer = Vec::new();
@@ -1093,12 +1196,29 @@ fn scan_gzip_reader<R>(
 where
     R: Read,
 {
-    if depth >= MAX_ALLOWED_RECURSION {
-        summary.record_skip(SkipReason::MaxArchiveDepth);
-        eprintln!(
-            "Skipped archive: maximum recursion reached: {}",
-            archive_path.display()
-        );
+    let mut archive_state = ArchiveScanState::new(depth);
+    scan_gzip_reader_with_state(
+        reader,
+        archive_path,
+        hash_database,
+        yara_scanner,
+        summary,
+        &mut archive_state,
+    )
+}
+
+fn scan_gzip_reader_with_state<R>(
+    reader: R,
+    archive_path: &Path,
+    hash_database: &HashDatabase,
+    yara_scanner: &mut yara_x::Scanner,
+    summary: &mut ScanSummaryStats,
+    archive_state: &mut ArchiveScanState,
+) -> Result<(), String>
+where
+    R: Read,
+{
+    if !archive_state.allow_archive(summary, archive_path) {
         return Ok(());
     }
 
@@ -1134,14 +1254,18 @@ where
 
     let inner_path = gzip_inner_virtual_path(archive_path);
 
-    scan_bytes(
+    archive_state.enter_child();
+    let result = scan_bytes_with_state(
         &inner_path,
         &decompressed,
         hash_database,
         yara_scanner,
         summary,
-        depth + 1,
-    )
+        archive_state,
+    );
+    archive_state.leave_child();
+
+    result
 }
 
 /// Helper function to decompress a gzip archive into a limited buffer.
@@ -1259,6 +1383,39 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    fn zip_bytes_with_numbered_files(count: usize) -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        for i in 0..count {
+            writer.start_file(format!("file-{i}.bin"), options).unwrap();
+            writer.write_all(b"payload").unwrap();
+        }
+
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn zip_bytes_with_padding_and_nested_zip(padding_entries: usize, nested_zip: &[u8]) -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        for i in 0..padding_entries {
+            writer
+                .start_file(format!("padding-{i}.bin"), options)
+                .unwrap();
+            writer.write_all(b"padding").unwrap();
+        }
+
+        writer.start_file("nested.zip", options).unwrap();
+        writer.write_all(nested_zip).unwrap();
+
+        writer.finish().unwrap().into_inner()
+    }
+
     fn zip_bytes_with_zero_file(path: &str, size: u64) -> Vec<u8> {
         let cursor = std::io::Cursor::new(Vec::new());
         let mut writer = zip::ZipWriter::new(cursor);
@@ -1280,6 +1437,23 @@ mod tests {
             header.set_mode(0o644);
             header.set_cksum();
             builder.append_data(&mut header, path, *bytes).unwrap();
+        }
+
+        builder.finish().unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    fn tar_bytes_with_numbered_files(count: usize) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+
+        for i in 0..count {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(7);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("file-{i}.bin"), &b"payload"[..])
+                .unwrap();
         }
 
         builder.finish().unwrap();
@@ -1630,6 +1804,165 @@ mod tests {
     }
 
     #[test]
+    fn archive_scan_state_tracks_depth_and_entry_limits() {
+        let mut summary = ScanSummaryStats::new();
+        let archive_path = Path::new("archive.zip");
+        let mut state = ArchiveScanState::new(MAX_ALLOWED_RECURSION - 1);
+
+        assert!(state.allow_archive(&mut summary, archive_path));
+        state.enter_child();
+        assert!(!state.allow_archive(&mut summary, archive_path));
+        state.leave_child();
+        assert!(state.allow_archive(&mut summary, archive_path));
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveDepth), 1);
+
+        state.entries_seen = MAX_ALLOWED_ARCHIVE_ENTRIES;
+        assert!(!state.record_entry(&mut summary, archive_path));
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 1);
+
+        state.depth = 0;
+        state.leave_child();
+        assert_eq!(state.depth, 0);
+    }
+
+    #[test]
+    fn scan_file_hashes_from_disk_reports_missing_path_error() {
+        let database = HashDatabase::default();
+        let target = tempfile::tempdir().unwrap().path().join("missing.bin");
+
+        let err = scan_file_hashes_from_disk(&target, &database).unwrap_err();
+
+        assert_eq!(err, "Unable to compare hash");
+    }
+
+    #[test]
+    fn scan_file_hashes_from_disk_returns_clean_for_unknown_file() {
+        let database = HashDatabase::default();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"unknown disk hash payload").unwrap();
+
+        let result = scan_file_hashes_from_disk(file.path(), &database).unwrap();
+
+        assert!(matches!(result, HashScanResult::Clean));
+    }
+
+    #[test]
+    fn scan_file_hashes_from_memory_detects_known_hash() {
+        let payload = b"known in-memory hash payload";
+        let (_database_file, database) = hash_database_for_payload(payload);
+
+        let result = scan_file_hashes_from_memory(payload, &database).unwrap();
+
+        assert!(matches!(result, HashScanResult::KnownHash { .. }));
+    }
+
+    #[test]
+    fn scan_file_hashes_from_memory_returns_clean_for_unknown_payload() {
+        let database = HashDatabase::default();
+
+        let result = scan_file_hashes_from_memory(b"unknown memory hash payload", &database)
+            .expect("memory hashing should succeed");
+
+        assert!(matches!(result, HashScanResult::Clean));
+    }
+
+    #[test]
+    fn scan_file_yara_from_disk_reports_missing_path_error() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let target = tempfile::tempdir().unwrap().path().join("missing.bin");
+
+        let err = scan_file_yara_from_disk(&target, &mut scanner).unwrap_err();
+
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn scan_file_yara_from_disk_returns_clean_and_matches_rules() {
+        let clean_rules = non_matching_rules();
+        let mut clean_scanner = yara_x::Scanner::new(&clean_rules);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"plain payload").unwrap();
+
+        let clean = scan_file_yara_from_disk(file.path(), &mut clean_scanner).unwrap();
+
+        assert!(matches!(clean, YaraScanResult::Clean));
+
+        let matching_rules = compile_rules(
+            r#"
+            rule Disk_Helper_Test {
+                strings:
+                    $marker = "disk-helper-marker"
+                condition:
+                    $marker
+            }
+            "#,
+        );
+        let mut matching_scanner = yara_x::Scanner::new(&matching_rules);
+        std::fs::write(file.path(), b"prefix disk-helper-marker suffix").unwrap();
+
+        let matched = scan_file_yara_from_disk(file.path(), &mut matching_scanner).unwrap();
+
+        match matched {
+            YaraScanResult::YaraRules { rules } => {
+                assert_eq!(rules.len(), 1);
+                assert_eq!(rules[0].name, "Disk_Helper_Test");
+            }
+            YaraScanResult::Clean => panic!("expected YARA rule match"),
+        }
+    }
+
+    #[test]
+    fn scan_file_yara_from_memory_returns_clean_and_matches_rules() {
+        let clean_rules = non_matching_rules();
+        let mut clean_scanner = yara_x::Scanner::new(&clean_rules);
+
+        let clean = scan_file_yara_from_memory(b"plain payload", &mut clean_scanner).unwrap();
+
+        assert!(matches!(clean, YaraScanResult::Clean));
+
+        let matching_rules = compile_rules(
+            r#"
+            rule Memory_Helper_Test {
+                strings:
+                    $marker = "memory-helper-marker"
+                condition:
+                    $marker
+            }
+            "#,
+        );
+        let mut matching_scanner = yara_x::Scanner::new(&matching_rules);
+
+        let matched = scan_file_yara_from_memory(
+            b"prefix memory-helper-marker suffix",
+            &mut matching_scanner,
+        )
+        .unwrap();
+
+        match matched {
+            YaraScanResult::YaraRules { rules } => {
+                assert_eq!(rules.len(), 1);
+                assert_eq!(rules[0].name, "Memory_Helper_Test");
+            }
+            YaraScanResult::Clean => panic!("expected YARA rule match"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_path_reports_error_for_non_file_targets() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+
+        let summary = scan_path(Path::new("/dev/null"), &database, &mut scanner);
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.total_files_scanned(), 0);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
     fn scan_path_reports_error_for_missing_target() {
         let rules = non_matching_rules();
         let mut scanner = yara_x::Scanner::new(&rules);
@@ -1785,6 +2118,21 @@ mod tests {
     }
 
     #[test]
+    fn scan_one_and_report_counts_error_for_missing_path() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let target = tempfile::tempdir().unwrap().path().join("missing.bin");
+
+        scan_one_and_report(&target, &database, &mut scanner, &mut summary);
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.total_files_scanned(), 0);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
     fn scan_one_and_report_records_known_hash_detection() {
         let rules = non_matching_rules();
         let mut scanner = yara_x::Scanner::new(&rules);
@@ -1865,20 +2213,75 @@ mod tests {
         let mut scanner = yara_x::Scanner::new(&rules);
         let database = HashDatabase::default();
         let mut summary = ScanSummaryStats::new();
+        let mut archive_state = ArchiveScanState::new(0);
 
-        scan_bytes(
+        scan_bytes_with_state(
             Path::new("archive.zip!/empty"),
             b"",
             &database,
             &mut scanner,
             &mut summary,
-            0,
+            &mut archive_state,
         )
         .unwrap();
 
         assert_eq!(summary.files_skipped, 1);
         assert_eq!(summary.skip_count(SkipReason::ZeroSize), 1);
         assert_eq!(summary.archive_entries_scanned, 0);
+    }
+
+    #[test]
+    fn scan_bytes_records_known_hash_detection_for_archive_entry() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let payload = b"known archive entry hash";
+        let (_database_file, database) = hash_database_for_payload(payload);
+        let mut summary = ScanSummaryStats::new();
+        let mut archive_state = ArchiveScanState::new(0);
+
+        scan_bytes_with_state(
+            Path::new("archive.zip!/known.bin"),
+            payload,
+            &database,
+            &mut scanner,
+            &mut summary,
+            &mut archive_state,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert_eq!(summary.known_hash_detections, 1);
+        assert_eq!(summary.detections.len(), 1);
+        assert_eq!(summary.detections[0].verdict, Verdict::Malicious);
+        assert_eq!(
+            summary.detections[0].surface,
+            DetectionSurface::ArchiveEntry
+        );
+    }
+
+    #[test]
+    fn scan_bytes_counts_clean_non_archive_payload_over_yara_threshold() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let mut archive_state = ArchiveScanState::new(0);
+
+        scan_bytes_with_state(
+            Path::new("archive.zip!/clean.bin"),
+            b"clean payload long enough to run archive detection and yara",
+            &database,
+            &mut scanner,
+            &mut summary,
+            &mut archive_state,
+        )
+        .unwrap();
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert_eq!(summary.known_hash_detections, 0);
+        assert_eq!(summary.yara_detections, 0);
+        assert!(summary.detections.is_empty());
     }
 
     #[test]
@@ -1897,14 +2300,15 @@ mod tests {
         let database = HashDatabase::default();
         let mut summary = ScanSummaryStats::new();
         let payload = b"prefix galen-test-marker suffix with enough bytes for yara";
+        let mut archive_state = ArchiveScanState::new(0);
 
-        scan_bytes(
+        scan_bytes_with_state(
             Path::new("archive.zip!/payload.bin"),
             payload,
             &database,
             &mut scanner,
             &mut summary,
-            0,
+            &mut archive_state,
         )
         .unwrap();
 
@@ -1930,14 +2334,15 @@ mod tests {
         let database = HashDatabase::default();
         let mut summary = ScanSummaryStats::new();
         let malformed_zip = b"PK\x03\x04not really a zip but long enough";
+        let mut archive_state = ArchiveScanState::new(0);
 
-        scan_bytes(
+        scan_bytes_with_state(
             Path::new("outer.zip!/bad.zip"),
             malformed_zip,
             &database,
             &mut scanner,
             &mut summary,
-            0,
+            &mut archive_state,
         )
         .unwrap();
 
@@ -1955,14 +2360,15 @@ mod tests {
         let mut summary = ScanSummaryStats::new();
         let mut malformed_gzip = vec![0x1f, 0x8b];
         malformed_gzip.extend_from_slice(b"not really gzip but long enough for archive probing");
+        let mut archive_state = ArchiveScanState::new(0);
 
-        scan_bytes(
+        scan_bytes_with_state(
             Path::new("outer.zip!/bad.gz"),
             &malformed_gzip,
             &database,
             &mut scanner,
             &mut summary,
-            0,
+            &mut archive_state,
         )
         .unwrap();
 
@@ -2183,6 +2589,95 @@ mod tests {
     }
 
     #[test]
+    fn scan_zip_archive_limits_entries_across_one_archive_tree() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let archive = zip_bytes_with_numbered_files(MAX_ALLOWED_ARCHIVE_ENTRIES + 1);
+
+        scan_zip_archive(
+            std::io::Cursor::new(archive),
+            Path::new("too-many.zip"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(
+            summary.archive_entries_scanned,
+            MAX_ALLOWED_ARCHIVE_ENTRIES as u64
+        );
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 1);
+    }
+
+    #[test]
+    fn scan_zip_archive_entry_limit_is_not_global_across_top_level_archives() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let archive = zip_bytes_with_numbered_files(MAX_ALLOWED_ARCHIVE_ENTRIES);
+
+        scan_zip_archive(
+            std::io::Cursor::new(archive.clone()),
+            Path::new("first.zip"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+        scan_zip_archive(
+            std::io::Cursor::new(archive),
+            Path::new("second.zip"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 2);
+        assert_eq!(
+            summary.archive_entries_scanned,
+            (MAX_ALLOWED_ARCHIVE_ENTRIES * 2) as u64
+        );
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 0);
+    }
+
+    #[test]
+    fn scan_zip_archive_entry_limit_is_cumulative_for_nested_archives() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let nested = zip_bytes_with_numbered_files(1);
+        let archive =
+            zip_bytes_with_padding_and_nested_zip(MAX_ALLOWED_ARCHIVE_ENTRIES - 1, &nested);
+
+        scan_zip_archive(
+            std::io::Cursor::new(archive),
+            Path::new("outer.zip"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 2);
+        assert_eq!(
+            summary.archive_entries_scanned,
+            MAX_ALLOWED_ARCHIVE_ENTRIES as u64
+        );
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 1);
+    }
+
+    #[test]
     fn scan_zip_archive_increments_depth_for_nested_archive() {
         let rules = non_matching_rules();
         let mut scanner = yara_x::Scanner::new(&rules);
@@ -2321,6 +2816,32 @@ mod tests {
         assert_eq!(summary.archives_scanned, 1);
         assert_eq!(summary.skip_count(SkipReason::MaxDecompressedBytes), 0);
         assert_eq!(summary.errors, 1);
+    }
+
+    #[test]
+    fn scan_tar_archive_limits_entries_across_one_archive_tree() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let archive = tar_bytes_with_numbered_files(MAX_ALLOWED_ARCHIVE_ENTRIES + 1);
+
+        scan_tar_archive(
+            std::io::Cursor::new(archive),
+            Path::new("too-many.tar"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(
+            summary.archive_entries_scanned,
+            MAX_ALLOWED_ARCHIVE_ENTRIES as u64
+        );
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 1);
     }
 
     #[test]

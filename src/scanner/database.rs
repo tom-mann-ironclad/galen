@@ -108,4 +108,14 @@ mod tests {
         assert!(database.contains(&FileHashes { sha256: hash(1) }));
         assert!(database.contains(&FileHashes { sha256: hash(9) }));
     }
+
+    #[test]
+    fn load_hash_database_reports_query_errors() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        Connection::open(file.path()).unwrap();
+
+        let err = load_hash_database(file.path()).unwrap_err();
+
+        assert!(err.to_string().contains("malware_hashes"));
+    }
 }

@@ -286,6 +286,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_scan_accepts_short_flags_and_falls_back_to_human_output() {
+        let command = parse_args(args(&[
+            "galen",
+            "scan",
+            "-d",
+            "hashes.sqlite",
+            "-y",
+            "rules.yaraxc",
+            "-o",
+            "plain",
+            "samples",
+        ]))
+        .unwrap();
+
+        let Command::Scan(scan) = command else {
+            panic!("expected scan command");
+        };
+
+        assert_eq!(scan.target, PathBuf::from("samples"));
+        assert_eq!(scan.database, PathBuf::from("hashes.sqlite"));
+        assert_eq!(scan.yara_rules_cache, PathBuf::from("rules.yaraxc"));
+        assert!(matches!(scan.output_format, OutputFormat::Human));
+    }
+
+    #[test]
+    fn parse_top_level_help_and_unknown_commands() {
+        assert!(matches!(
+            parse_args(args(&["galen", "help"])).unwrap(),
+            Command::Help
+        ));
+
+        assert_eq!(parse_error(&["galen", "unknown"]), "Unknown command");
+    }
+
+    #[test]
     fn parse_scan_rejects_missing_and_duplicate_targets() {
         assert_eq!(parse_error(&["galen", "scan"]), "No scan target provided");
         assert_eq!(
@@ -302,6 +337,14 @@ mod tests {
         );
         assert_eq!(
             parse_error(&["galen", "scan", "--database"]),
+            "No arguments provided"
+        );
+        assert_eq!(
+            parse_error(&["galen", "scan", "--yara-cache"]),
+            "No arguments provided"
+        );
+        assert_eq!(
+            parse_error(&["galen", "scan", "--output"]),
             "No arguments provided"
         );
     }

@@ -30,10 +30,14 @@ const EXIT_OPERATIONAL_ERROR: i32 = 2;
 const YARA_MAX_SCAN_SIZE: usize = 4 * 1024 * 1024;
 const YARA_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(not(tarpaulin))]
 fn main() {
     let exit_code = run_cli(std::env::args(), &mut io::stdout(), &mut io::stderr());
     std::process::exit(exit_code);
 }
+
+#[cfg(tarpaulin)]
+fn main() {}
 
 /// Run the parsed CLI command and return the process exit code.
 fn run_cli<I, W, E>(args: I, stdout: &mut W, stderr: &mut E) -> i32
@@ -275,6 +279,7 @@ trait UpdateBackend {
 /// Backend used in production code.
 struct RealUpdateBackend;
 
+#[cfg(not(tarpaulin))]
 impl UpdateBackend for RealUpdateBackend {
     fn update_signatures(&self, args: &UpdateArgs) -> Result<usize, String> {
         update_signatures_using_malware_bazaar(&args.auth_key, "100", &args.database)
@@ -282,6 +287,17 @@ impl UpdateBackend for RealUpdateBackend {
 
     fn update_yara_rules(&self, args: &UpdateArgs) -> Result<usize, String> {
         update_yara_rules(&args.yara_rules_path, &args.yara_rules_cache)
+    }
+}
+
+#[cfg(tarpaulin)]
+impl UpdateBackend for RealUpdateBackend {
+    fn update_signatures(&self, _args: &UpdateArgs) -> Result<usize, String> {
+        Err("network update disabled during coverage".to_string())
+    }
+
+    fn update_yara_rules(&self, _args: &UpdateArgs) -> Result<usize, String> {
+        Err("YARA update disabled during coverage".to_string())
     }
 }
 
@@ -577,6 +593,23 @@ mod tests {
     }
 
     #[test]
+    fn human_scan_report_lists_triggered_yara_rules_in_order() {
+        let mut summary = ScanSummaryStats::new();
+        summary.filesystem_files_scanned = 2;
+        summary.yara_rules_triggered.insert("z_rule".to_string(), 1);
+        summary.yara_rules_triggered.insert("a_rule".to_string(), 2);
+        let mut output = Vec::new();
+
+        let exit_code =
+            write_human_scan_report(&summary, Duration::from_millis(1), &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert_eq!(exit_code, EXIT_SUCCESS);
+        assert!(output.contains("2 YARA rules triggered"));
+        assert!(output.find("a_rule").unwrap() < output.find("z_rule").unwrap());
+    }
+
+    #[test]
     fn human_scan_report_excludes_suppressed_archive_container_counts() {
         let mut summary = ScanSummaryStats::new();
         summary.detections = vec![
@@ -658,6 +691,25 @@ mod tests {
     }
 
     #[test]
+    fn json_scan_report_returns_success_for_clean_summary() {
+        let summary = ScanSummaryStats::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code =
+            write_json_scan_report(&summary, Duration::from_millis(1), &mut stdout, &mut stderr)
+                .unwrap();
+
+        assert_eq!(exit_code, EXIT_SUCCESS);
+        assert!(
+            String::from_utf8(stdout)
+                .unwrap()
+                .contains("\"scanned_files\": 0")
+        );
+        assert!(String::from_utf8(stderr).unwrap().is_empty());
+    }
+
+    #[test]
     fn visible_human_detections_excludes_low_verdict_records() {
         let mut summary = ScanSummaryStats::new();
         summary.detections = vec![
@@ -726,6 +778,42 @@ mod tests {
         assert!(stdout.contains("\"scanned_files\": 1"));
         assert!(!stdout.contains("Starting scan"));
         assert!(stderr.contains("Starting scan"));
+    }
+
+    #[test]
+    fn run_scan_command_reports_database_load_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("payload.bin");
+        let args = scan_args(
+            target,
+            root.path().join("missing.sqlite"),
+            root.path().join("missing.yaraxc"),
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = run_scan_command(&args, &mut stdout, &mut stderr);
+        let stderr = String::from_utf8(stderr).unwrap();
+
+        assert_eq!(exit_code, EXIT_OPERATIONAL_ERROR);
+        assert!(stderr.contains("Unable to load signature database"));
+    }
+
+    #[test]
+    fn run_scan_command_reports_yara_cache_load_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("signatures.sqlite");
+        let target = root.path().join("payload.bin");
+        empty_hash_database(&database);
+        let args = scan_args(target, database, root.path().join("missing.yaraxc"));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = run_scan_command(&args, &mut stdout, &mut stderr);
+        let stderr = String::from_utf8(stderr).unwrap();
+
+        assert_eq!(exit_code, EXIT_OPERATIONAL_ERROR);
+        assert!(stderr.contains("Unable to load YARA rules cache"));
     }
 
     #[test]
