@@ -235,10 +235,9 @@ Galen should not currently be treated as a production anti-malware replacement.
 
 Known limitations include:
 
-* Test coverage is still incomplete (~81.4% code coverage with a ~76.4% mutation coverage)
-* JSON schema versioning is not fully documented yet
+* Test coverage is still incomplete (~81.4% code coverage with a ~76.5% mutation coverage)
 * Configuration support is still limited
-* No packaged `.deb` or `.rpm` release yet (although nightly is available)
+* No packaged `.deb` or `.rpm` stable release yet (although nightly is available)
 * Limited CI/CD pipeline
 * Detection quality is still being calibrated
 * Archive handling needs more regression tests
@@ -255,11 +254,8 @@ Near-term priorities:
 
 * Increase unit test, mutation test and regression test coverage
 * Add a corpus test runner using JSON output
-* Define and document JSON schema versioning
 * Add custom error types
 * Make invalid CLI arguments fail closed
-* Ensure JSON mode always emits valid JSON, including on scan failures
-* Align exit codes between human and JSON output
 * Add configurable scan limits
 * Add regression tests for archive edge cases
 * Improve CI with additional testing, cross compilation, benchmarking and code security steps

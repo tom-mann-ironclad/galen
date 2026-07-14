@@ -282,10 +282,10 @@ where
         return Ok(EXIT_OPERATIONAL_ERROR);
     }
 
-    if summary.detections.is_empty() {
-        Ok(EXIT_SUCCESS)
-    } else {
+    if !visible_human_detections(summary).is_empty() {
         Ok(EXIT_DETECTIONS)
+    } else {
+        Ok(EXIT_SUCCESS)
     }
 }
 
@@ -694,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn json_scan_report_returns_detection_exit_for_any_detection() {
+    fn json_scan_report_returns_detection_exit_for_visible_detection() {
         let mut summary = ScanSummaryStats::new();
         summary.detections = vec![detection(
             "payload.bin",
@@ -709,6 +709,52 @@ mod tests {
                 .unwrap();
 
         assert_eq!(exit_code, EXIT_DETECTIONS);
+        assert!(String::from_utf8(stderr).unwrap().is_empty());
+    }
+
+    #[test]
+    fn json_scan_report_returns_success_for_informational_only_detection() {
+        let mut summary = ScanSummaryStats::new();
+        summary.detections = vec![detection(
+            "info.bin",
+            DetectionSurface::FileSystemFile,
+            Verdict::Informational,
+        )];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code =
+            write_json_scan_report(&summary, Duration::from_millis(1), &mut stdout, &mut stderr)
+                .unwrap();
+
+        assert_eq!(exit_code, EXIT_SUCCESS);
+        assert!(String::from_utf8(stderr).unwrap().is_empty());
+    }
+
+    #[test]
+    fn json_scan_report_returns_success_for_suppressed_container_without_visible_child() {
+        let mut summary = ScanSummaryStats::new();
+        summary.detections = vec![
+            detection(
+                "archive.zip",
+                DetectionSurface::ArchiveContainer,
+                Verdict::Malicious,
+            ),
+            detection(
+                "archive.zip!/info.bin",
+                DetectionSurface::ArchiveEntry,
+                Verdict::Informational,
+            ),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code =
+            write_json_scan_report(&summary, Duration::from_millis(1), &mut stdout, &mut stderr)
+                .unwrap();
+
+        assert_eq!(exit_code, EXIT_SUCCESS);
+        assert!(visible_human_detections(&summary).is_empty());
         assert!(String::from_utf8(stderr).unwrap().is_empty());
     }
 
@@ -729,6 +775,71 @@ mod tests {
                 .contains("\"scanned_files\": 0")
         );
         assert!(String::from_utf8(stderr).unwrap().is_empty());
+    }
+
+    #[test]
+    fn human_and_json_scan_reports_use_aligned_exit_codes() {
+        let cases = [
+            ("clean", ScanSummaryStats::new()),
+            {
+                let mut summary = ScanSummaryStats::new();
+                summary.detections = vec![detection(
+                    "info.bin",
+                    DetectionSurface::FileSystemFile,
+                    Verdict::Informational,
+                )];
+                ("informational", summary)
+            },
+            {
+                let mut summary = ScanSummaryStats::new();
+                summary.detections = vec![detection(
+                    "payload.bin",
+                    DetectionSurface::FileSystemFile,
+                    Verdict::Malicious,
+                )];
+                ("visible_detection", summary)
+            },
+            {
+                let mut summary = ScanSummaryStats::new();
+                summary.detections = vec![
+                    detection(
+                        "archive.zip",
+                        DetectionSurface::ArchiveContainer,
+                        Verdict::Malicious,
+                    ),
+                    detection(
+                        "archive.zip!/info.bin",
+                        DetectionSurface::ArchiveEntry,
+                        Verdict::Informational,
+                    ),
+                ];
+                ("suppressed_container", summary)
+            },
+            {
+                let mut summary = ScanSummaryStats::new();
+                summary.errors = 1;
+                ("operational_error", summary)
+            },
+        ];
+
+        for (name, summary) in cases {
+            let mut human_stdout = Vec::new();
+            let mut json_stdout = Vec::new();
+            let mut json_stderr = Vec::new();
+
+            let human_exit =
+                write_human_scan_report(&summary, Duration::from_millis(1), &mut human_stdout)
+                    .unwrap();
+            let json_exit = write_json_scan_report(
+                &summary,
+                Duration::from_millis(1),
+                &mut json_stdout,
+                &mut json_stderr,
+            )
+            .unwrap();
+
+            assert_eq!(human_exit, json_exit, "{name}");
+        }
     }
 
     #[test]
