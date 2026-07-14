@@ -1,0 +1,334 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tom-mann-ironclad/galen/schemas/scan-report-v1.schema.json",
+  "title": "Galen scan output v1",
+  "description": "JSON output emitted by `galen scan --output json` when schema_version is 1.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/scan_report"
+    },
+    {
+      "$ref": "#/$defs/error_report"
+    }
+  ],
+  "$defs": {
+    "scan_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "status",
+        "summary",
+        "yara",
+        "visible_detections",
+        "suppressed_detections"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "status": {
+          "const": "ok"
+        },
+        "summary": {
+          "$ref": "#/$defs/report_summary"
+        },
+        "yara": {
+          "$ref": "#/$defs/yara_report"
+        },
+        "visible_detections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/detection_record"
+          }
+        },
+        "suppressed_detections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/detection_record"
+          }
+        }
+      }
+    },
+    "error_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "status",
+        "error"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "status": {
+          "const": "error"
+        },
+        "error": {
+          "$ref": "#/$defs/error_details"
+        }
+      }
+    },
+    "error_details": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "message"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "signature_database_load_failed",
+            "yara_rules_load_failed"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "report_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scanned_files",
+        "filesystem_files",
+        "archive_entries",
+        "scanned_archives",
+        "skipped_files",
+        "skips",
+        "raw_detection_records",
+        "visible_detection_records",
+        "suppressed_detection_records",
+        "raw_detections_by_surface",
+        "scan_time_ms"
+      ],
+      "properties": {
+        "scanned_files": {
+          "$ref": "#/$defs/count"
+        },
+        "filesystem_files": {
+          "$ref": "#/$defs/count"
+        },
+        "archive_entries": {
+          "$ref": "#/$defs/count"
+        },
+        "scanned_archives": {
+          "$ref": "#/$defs/count"
+        },
+        "skipped_files": {
+          "$ref": "#/$defs/count"
+        },
+        "skips": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/skip_item"
+          }
+        },
+        "raw_detection_records": {
+          "$ref": "#/$defs/count"
+        },
+        "visible_detection_records": {
+          "$ref": "#/$defs/count"
+        },
+        "suppressed_detection_records": {
+          "$ref": "#/$defs/count"
+        },
+        "raw_detections_by_surface": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/surface_item"
+          }
+        },
+        "scan_time_ms": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "skip_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "count"
+      ],
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/skip_reason"
+        },
+        "count": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "surface_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "surface",
+        "count"
+      ],
+      "properties": {
+        "surface": {
+          "$ref": "#/$defs/detection_surface"
+        },
+        "count": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "yara_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rules_triggered"
+      ],
+      "properties": {
+        "rules_triggered": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/yara_rule"
+          }
+        }
+      }
+    },
+    "yara_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule",
+        "files"
+      ],
+      "properties": {
+        "rule": {
+          "type": "string",
+          "minLength": 1
+        },
+        "files": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "detection_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "score",
+        "verdict",
+        "surface",
+        "findings"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "score": {
+          "$ref": "#/$defs/u16"
+        },
+        "verdict": {
+          "$ref": "#/$defs/verdict"
+        },
+        "surface": {
+          "$ref": "#/$defs/detection_surface"
+        },
+        "findings": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/finding"
+          }
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "score",
+        "confidence"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/finding_id"
+        },
+        "score": {
+          "$ref": "#/$defs/u16"
+        },
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        }
+      }
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "u16": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "skip_reason": {
+      "type": "string",
+      "enum": [
+        "zero_size",
+        "maximum_recursion_reached",
+        "maximum_archive_entries_reached",
+        "maximum_decompressed_size_reached",
+        "suspicious_compression_ratio",
+        "malformed_archive",
+        "unsupported_archive",
+        "archive_read_error",
+        "file_encrypted",
+        "file_is_symlink"
+      ]
+    },
+    "detection_surface": {
+      "type": "string",
+      "enum": [
+        "filesystem_file",
+        "archive_entry",
+        "archive_container"
+      ]
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "clean",
+        "informational",
+        "suspicious",
+        "likely_malicious",
+        "malicious"
+      ]
+    },
+    "finding_id": {
+      "type": "string",
+      "enum": [
+        "known_hash",
+        "single_yara_rule_match",
+        "multiple_yara_rule_match",
+        "persistence_indicator",
+        "rootkit_indicator",
+        "packer_indicator",
+        "static_lrd_preload_reference",
+        "writable_executable_segement",
+        "runtime_memfd_exec"
+      ]
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    }
+  }
+}

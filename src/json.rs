@@ -6,9 +6,25 @@ use crate::{
 };
 use serde::Serialize;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportStatus {
+    Ok,
+    Error,
+}
+
+impl ReportStatus {
+    pub fn json_label(self) -> &'static str {
+        match self {
+            ReportStatus::Ok => "ok",
+            ReportStatus::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ScanReport {
     pub schema_version: u16,
+    pub status: String,
     pub summary: ReportSummary,
     pub yara: YaraReport,
     pub visible_detections: Vec<DetectionReportRecord>,
@@ -31,6 +47,7 @@ impl ScanReport {
 
         Self {
             schema_version: 1,
+            status: ReportStatus::Ok.json_label().to_string(),
             summary: ReportSummary::from_summary(
                 summary,
                 &visible_records,
@@ -49,6 +66,29 @@ impl ScanReport {
                 .collect(),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ErrorReport {
+    pub schema_version: u16,
+    pub status: String,
+    pub error: ErrorReportDetails,
+}
+
+impl ErrorReport {
+    pub fn new(kind: &'static str, message: String) -> Self {
+        Self {
+            schema_version: 1,
+            status: ReportStatus::Error.json_label().to_string(),
+            error: ErrorReportDetails { kind, message },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ErrorReportDetails {
+    pub kind: &'static str,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,6 +293,7 @@ mod tests {
         let report = ScanReport::from_summary(&summary, Duration::from_millis(25));
 
         assert_eq!(report.schema_version, 1);
+        assert_eq!(report.status, "ok");
         assert_eq!(report.summary.scanned_files, 2);
         assert_eq!(report.summary.visible_detection_records, 1);
         assert_eq!(report.summary.suppressed_detection_records, 1);
@@ -299,5 +340,24 @@ mod tests {
         );
         assert_eq!(report.summary.raw_detections_by_surface[0].count, 1);
         assert_eq!(report.visible_detections[0].verdict, "malicious");
+    }
+
+    #[test]
+    fn report_status_json_labels_are_stable() {
+        assert_eq!(ReportStatus::Ok.json_label(), "ok");
+        assert_eq!(ReportStatus::Error.json_label(), "error");
+    }
+
+    #[test]
+    fn error_report_uses_error_status_and_details() {
+        let report = ErrorReport::new(
+            "signature_database_load_failed",
+            "unable to open database".to_string(),
+        );
+
+        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.status, "error");
+        assert_eq!(report.error.kind, "signature_database_load_failed");
+        assert_eq!(report.error.message, "unable to open database");
     }
 }

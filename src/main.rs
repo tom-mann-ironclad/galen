@@ -22,7 +22,7 @@ use crate::updater::{
 
 use crate::cli::{Command, OutputFormat, ScanArgs, UpdateArgs, parse_args};
 
-use crate::json::ScanReport;
+use crate::json::{ErrorReport, ScanReport};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_DETECTIONS: i32 = 1;
@@ -77,7 +77,11 @@ where
     let hash_database = match load_hash_database(&args.database) {
         Ok(database) => database,
         Err(err) => {
-            let _ = writeln!(stderr, "Unable to load signature database: {}", err);
+            let message = format!("Unable to load signature database: {}", err);
+            let _ = writeln!(stderr, "{}", message);
+            if args.output_format == OutputFormat::Json {
+                let _ = write_json_error_report("signature_database_load_failed", message, stdout);
+            }
             return EXIT_OPERATIONAL_ERROR;
         }
     };
@@ -91,7 +95,11 @@ where
     let rules = match load_yara_rules_cache(&args.yara_rules_cache) {
         Ok(cache) => cache,
         Err(err) => {
-            let _ = writeln!(stderr, "Unable to load YARA rules cache: {}", err);
+            let message = format!("Unable to load YARA rules cache: {}", err);
+            let _ = writeln!(stderr, "{}", message);
+            if args.output_format == OutputFormat::Json {
+                let _ = write_json_error_report("yara_rules_load_failed", message, stdout);
+            }
             return EXIT_OPERATIONAL_ERROR;
         }
     };
@@ -112,6 +120,20 @@ where
         OutputFormat::Json => write_json_scan_report(&summary, scan_time, stdout, stderr)
             .unwrap_or(EXIT_OPERATIONAL_ERROR),
     }
+}
+
+/// Write a JSON operational error report to stdout.
+fn write_json_error_report<W>(kind: &'static str, message: String, stdout: &mut W) -> io::Result<()>
+where
+    W: Write,
+{
+    let report = ErrorReport::new(kind, message);
+
+    writeln!(
+        stdout,
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(io::Error::other)?
+    )
 }
 
 /// Apply the scanner limits used by the command-line scan path.
@@ -775,6 +797,7 @@ mod tests {
 
         assert_eq!(exit_code, EXIT_SUCCESS);
         assert!(stdout.contains("\"schema_version\": 1"));
+        assert!(stdout.contains("\"status\": \"ok\""));
         assert!(stdout.contains("\"scanned_files\": 1"));
         assert!(!stdout.contains("Starting scan"));
         assert!(stderr.contains("Starting scan"));
@@ -800,6 +823,31 @@ mod tests {
     }
 
     #[test]
+    fn run_scan_command_reports_database_load_errors_as_json() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("payload.bin");
+        let mut args = scan_args(
+            target,
+            root.path().join("missing.sqlite"),
+            root.path().join("missing.yaraxc"),
+        );
+        args.output_format = OutputFormat::Json;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = run_scan_command(&args, &mut stdout, &mut stderr);
+        let stdout = String::from_utf8(stdout).unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+
+        assert_eq!(exit_code, EXIT_OPERATIONAL_ERROR);
+        assert!(stdout.contains("\"schema_version\": 1"));
+        assert!(stdout.contains("\"status\": \"error\""));
+        assert!(stdout.contains("\"kind\": \"signature_database_load_failed\""));
+        assert!(stdout.contains("\"message\": \"Unable to load signature database:"));
+        assert!(stderr.contains("Unable to load signature database"));
+    }
+
+    #[test]
     fn run_scan_command_reports_yara_cache_load_errors() {
         let root = tempfile::tempdir().unwrap();
         let database = root.path().join("signatures.sqlite");
@@ -813,6 +861,29 @@ mod tests {
         let stderr = String::from_utf8(stderr).unwrap();
 
         assert_eq!(exit_code, EXIT_OPERATIONAL_ERROR);
+        assert!(stderr.contains("Unable to load YARA rules cache"));
+    }
+
+    #[test]
+    fn run_scan_command_reports_yara_cache_load_errors_as_json() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("signatures.sqlite");
+        let target = root.path().join("payload.bin");
+        empty_hash_database(&database);
+        let mut args = scan_args(target, database, root.path().join("missing.yaraxc"));
+        args.output_format = OutputFormat::Json;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = run_scan_command(&args, &mut stdout, &mut stderr);
+        let stdout = String::from_utf8(stdout).unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+
+        assert_eq!(exit_code, EXIT_OPERATIONAL_ERROR);
+        assert!(stdout.contains("\"schema_version\": 1"));
+        assert!(stdout.contains("\"status\": \"error\""));
+        assert!(stdout.contains("\"kind\": \"yara_rules_load_failed\""));
+        assert!(stdout.contains("\"message\": \"Unable to load YARA rules cache:"));
         assert!(stderr.contains("Unable to load YARA rules cache"));
     }
 

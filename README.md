@@ -23,12 +23,12 @@ Implemented so far:
 * File skip reasons
 * Human-readable scan summaries
 * JSON scan output
+* Versioned JSON scan output schema
 * Detection records including path, score, verdict, surface, and findings
 
 Still in progress:
 
 * Expanded regression and corpus tests
-* Stable JSON schema documentation
 * Custom error types
 * Configurable scan limits
 * CI/CD
@@ -235,7 +235,7 @@ Galen should not currently be treated as a production anti-malware replacement.
 
 Known limitations include:
 
-* Test coverage is still incomplete (~81.2% code coverage with a ~76.1% mutation coverage)
+* Test coverage is still incomplete (~81.4% code coverage with a ~76.4% mutation coverage)
 * JSON schema versioning is not fully documented yet
 * Configuration support is still limited
 * No packaged `.deb` or `.rpm` release yet (although nightly is available)
@@ -296,6 +296,11 @@ Emit JSON output:
 galen scan ./some_directory --output json
 ```
 
+The JSON scan output includes `schema_version` and `status`. Version `1` is
+documented by [`schemas/scan-report-v1.schema.json`](schemas/scan-report-v1.schema.json).
+A completed scan uses `status: "ok"` and includes the scan summary. A failed scan
+uses `status: "error"` and includes an `error` object with `kind` and `message`.
+
 Exit codes are intended to follow this model:
 
 ```text
@@ -354,4 +359,3 @@ Galen does not ship malware signatures, YARA rules, or third-party detection fee
 Galen is experimental software.
 
 It may miss malicious files. It may produce false positives. It may behave incorrectly on malformed inputs. Do not rely on it as your only security control.
-
