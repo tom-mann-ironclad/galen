@@ -1,9 +1,8 @@
 use rusqlite::{Connection, params};
 use serde::Deserialize;
-use std::{
-    io::{BufRead, BufReader, Seek, SeekFrom, copy},
-    path::Path,
-};
+#[cfg(not(tarpaulin))]
+use std::io::{BufReader, Seek, SeekFrom, copy};
+use std::{io::BufRead, path::Path};
 
 const CREATE_METADATA_TABLE: &str = r#"
         CREATE TABLE IF NOT EXISTS update_metadata (
@@ -24,13 +23,13 @@ const CREATE_MALWARE_HASH_TABLE: &str = r#"
             imported_at INTEGER NOT NULL
     );"#;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct MalwareBazaarResponse {
     query_status: String, // TODO: Make this typed?
     data: Option<Vec<MalwareBazaarSample>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct MalwareBazaarSample {
     sha256_hash: String,
     family: Option<String>,
@@ -45,8 +44,58 @@ pub fn update_signatures_using_malware_bazaar(
     selector: &str,
     db_path: impl AsRef<Path>,
 ) -> Result<usize, String> {
-    let _ = create_database_tables(&db_path);
-    let existing_entries = match malware_hash_count(&db_path) {
+    update_signatures_with_client(
+        auth_key,
+        selector,
+        db_path.as_ref(),
+        &LiveMalwareBazaarClient,
+    )
+}
+
+trait MalwareBazaarClient {
+    fn fetch_recent(
+        &self,
+        auth_key: &str,
+        selector: &str,
+    ) -> Result<Vec<MalwareBazaarSample>, Box<dyn std::error::Error>>;
+
+    fn fetch_full(
+        &self,
+        auth_key: &str,
+        db_path: &Path,
+    ) -> Result<usize, Box<dyn std::error::Error>>;
+}
+
+#[cfg(not(tarpaulin))]
+struct LiveMalwareBazaarClient;
+
+#[cfg(not(tarpaulin))]
+impl MalwareBazaarClient for LiveMalwareBazaarClient {
+    fn fetch_recent(
+        &self,
+        auth_key: &str,
+        selector: &str,
+    ) -> Result<Vec<MalwareBazaarSample>, Box<dyn std::error::Error>> {
+        fetch_malware_bazaar_recent_hashes(auth_key, selector)
+    }
+
+    fn fetch_full(
+        &self,
+        auth_key: &str,
+        db_path: &Path,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        fetch_malware_bazaar_full_hashes(auth_key, db_path)
+    }
+}
+
+fn update_signatures_with_client(
+    auth_key: &str,
+    selector: &str,
+    db_path: &Path,
+    client: &impl MalwareBazaarClient,
+) -> Result<usize, String> {
+    create_database_tables(db_path).map_err(|err| err.to_string())?;
+    let existing_entries = match malware_hash_count(db_path) {
         Ok(count) => count,
         Err(err) => return Err(err.to_string()),
     };
@@ -54,13 +103,13 @@ pub fn update_signatures_using_malware_bazaar(
     // If we have no malware signatures we need to bootstrap the database.
     if existing_entries == 0 {
         eprintln!("Empty database found, bootstrapping...");
-        match fetch_malware_bazaar_full_hashes(auth_key, &db_path) {
+        match client.fetch_full(auth_key, db_path) {
             Ok(count) => return Ok(count),
             Err(err) => return Err(err.to_string()),
         }
     }
 
-    let samples = match fetch_malware_bazaar_recent_hashes(auth_key, selector) {
+    let samples = match client.fetch_recent(auth_key, selector) {
         Ok(samples) => samples,
         Err(err) => return Err(err.to_string()),
     };
@@ -289,7 +338,49 @@ fn malware_hash_count(path: impl AsRef<Path>) -> Result<i64, rusqlite::Error> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use std::cell::Cell;
     use std::io::Cursor;
+
+    struct FakeMalwareBazaarClient {
+        recent: Result<Vec<MalwareBazaarSample>, &'static str>,
+        full: Result<usize, &'static str>,
+        recent_calls: Cell<usize>,
+        full_calls: Cell<usize>,
+    }
+
+    impl FakeMalwareBazaarClient {
+        fn new(
+            recent: Result<Vec<MalwareBazaarSample>, &'static str>,
+            full: Result<usize, &'static str>,
+        ) -> Self {
+            Self {
+                recent,
+                full,
+                recent_calls: Cell::new(0),
+                full_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl MalwareBazaarClient for FakeMalwareBazaarClient {
+        fn fetch_recent(
+            &self,
+            _auth_key: &str,
+            _selector: &str,
+        ) -> Result<Vec<MalwareBazaarSample>, Box<dyn std::error::Error>> {
+            self.recent_calls.set(self.recent_calls.get() + 1);
+            self.recent.clone().map_err(|err| String::from(err).into())
+        }
+
+        fn fetch_full(
+            &self,
+            _auth_key: &str,
+            _db_path: &Path,
+        ) -> Result<usize, Box<dyn std::error::Error>> {
+            self.full_calls.set(self.full_calls.get() + 1);
+            self.full.map_err(|err| String::from(err).into())
+        }
+    }
 
     fn sample(hash: &str, family: Option<&str>, file_type: Option<&str>) -> MalwareBazaarSample {
         MalwareBazaarSample {
@@ -320,6 +411,17 @@ mod tests {
         assert_eq!(decoded[0], 0x12);
         assert_eq!(decoded[1], 0xab);
         assert_eq!(decoded[2], 0xf0);
+    }
+
+    #[test]
+    fn decode_sha256_hex_does_not_cancel_overlapping_nibbles() {
+        let decoded =
+            decode_sha256_hex("ff7e810000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
+
+        assert_eq!(decoded[0], 0xff);
+        assert_eq!(decoded[1], 0x7e);
+        assert_eq!(decoded[2], 0x81);
     }
 
     #[test]
@@ -365,6 +467,17 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 
         assert_eq!(inserted, 2);
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn insert_hash_lines_accepts_blank_and_comment_only_input_without_inserting() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+
+        let inserted = insert_hash_lines(file.path(), Cursor::new(b"\n # not-a-hash\n\n")).unwrap();
+
+        assert_eq!(inserted, 0);
+        assert_eq!(malware_hash_count(file.path()).unwrap(), 0);
     }
 
     #[test]
@@ -455,5 +568,96 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
         .unwrap();
 
         assert_eq!(malware_hash_count(file.path()).unwrap(), 1);
+    }
+
+    #[test]
+    fn update_signatures_bootstraps_empty_database_with_full_fetch() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let client = FakeMalwareBazaarClient::new(Ok(vec![]), Ok(7));
+
+        let updated =
+            update_signatures_with_client("auth", "selector", file.path(), &client).unwrap();
+
+        assert_eq!(updated, 7);
+        assert_eq!(client.full_calls.get(), 1);
+        assert_eq!(client.recent_calls.get(), 0);
+    }
+
+    #[test]
+    fn update_signatures_fetches_recent_for_existing_database() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+        insert_hash_lines(
+            file.path(),
+            Cursor::new(b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n"),
+        )
+        .unwrap();
+        let client = FakeMalwareBazaarClient::new(
+            Ok(vec![sample(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                Some("family"),
+                Some("elf"),
+            )]),
+            Ok(99),
+        );
+
+        let updated =
+            update_signatures_with_client("auth", "selector", file.path(), &client).unwrap();
+
+        assert_eq!(updated, 1);
+        assert_eq!(malware_hash_count(file.path()).unwrap(), 2);
+        assert_eq!(client.full_calls.get(), 0);
+        assert_eq!(client.recent_calls.get(), 1);
+    }
+
+    #[test]
+    fn update_signatures_returns_zero_when_recent_fetch_has_no_samples() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+        insert_hash_lines(
+            file.path(),
+            Cursor::new(b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n"),
+        )
+        .unwrap();
+        let client = FakeMalwareBazaarClient::new(Ok(vec![]), Ok(99));
+
+        let updated =
+            update_signatures_with_client("auth", "selector", file.path(), &client).unwrap();
+
+        assert_eq!(updated, 0);
+        assert_eq!(malware_hash_count(file.path()).unwrap(), 1);
+        assert_eq!(client.full_calls.get(), 0);
+        assert_eq!(client.recent_calls.get(), 1);
+    }
+
+    #[test]
+    fn update_signatures_propagates_fetch_errors() {
+        let empty = tempfile::NamedTempFile::new().unwrap();
+        let full_error_client = FakeMalwareBazaarClient::new(Ok(vec![]), Err("full failed"));
+
+        let err =
+            update_signatures_with_client("auth", "selector", empty.path(), &full_error_client)
+                .unwrap_err();
+
+        assert_eq!(err, "full failed");
+
+        let existing = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(existing.path()).unwrap();
+        insert_hash_lines(
+            existing.path(),
+            Cursor::new(b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n"),
+        )
+        .unwrap();
+        let recent_error_client = FakeMalwareBazaarClient::new(Err("recent failed"), Ok(99));
+
+        let err = update_signatures_with_client(
+            "auth",
+            "selector",
+            existing.path(),
+            &recent_error_client,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "recent failed");
     }
 }

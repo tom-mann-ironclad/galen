@@ -374,6 +374,73 @@ mod tests {
     }
 
     #[test]
+    fn classify_yara_rule_repeated_hints_do_not_toggle_matches_off() {
+        assert!(matches!(
+            classify_yara_rule("credential_stealer", ["password"], ["credential"]),
+            YaraRuleClass::CredentialAccess
+        ));
+        assert!(matches!(
+            classify_yara_rule(
+                "ld_preload_persistence",
+                ["ldpreload", "persistence"],
+                std::iter::empty()
+            ),
+            YaraRuleClass::Persistence
+        ));
+        assert!(matches!(
+            classify_yara_rule("packed_upx_binary", ["upx", "cryptor"], std::iter::empty()),
+            YaraRuleClass::PackerOrObfuscation
+        ));
+        assert!(matches!(
+            classify_yara_rule("EICAR_Test_File", ["eicar"], ["EICAR"]),
+            YaraRuleClass::EICAR
+        ));
+        assert!(matches!(
+            classify_yara_rule("AMTSO_Test_File", ["amtso"], ["AMTSO"]),
+            YaraRuleClass::AMTSO
+        ));
+    }
+
+    #[test]
+    fn classify_yara_rule_duplicate_tags_do_not_toggle_matches_off() {
+        let cases = [
+            (
+                "persistence_duplicate_tags",
+                ["cron", "systemd"].as_slice(),
+                YaraRuleClass::Persistence,
+            ),
+            (
+                "eicar_duplicate_tags",
+                ["eicar", "eicar"].as_slice(),
+                YaraRuleClass::EICAR,
+            ),
+            (
+                "amtso_duplicate_tags",
+                ["amtso", "amtso"].as_slice(),
+                YaraRuleClass::AMTSO,
+            ),
+            (
+                "packer_duplicate_tags",
+                ["upx", "cryptor"].as_slice(),
+                YaraRuleClass::PackerOrObfuscation,
+            ),
+            (
+                "credential_duplicate_tags",
+                ["password", "stealer"].as_slice(),
+                YaraRuleClass::CredentialAccess,
+            ),
+        ];
+
+        for (name, tags, expected) in cases {
+            let class = classify_yara_rule("generic_rule", tags.iter().copied(), []);
+            assert!(
+                std::mem::discriminant(&class) == std::mem::discriminant(&expected),
+                "{name}: got {class:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn infer_persistence_strength_increases_when_multiple_primitives_are_seen() {
         assert!(matches!(
             infer_persistence_strength("cron_rule", std::iter::empty()),
@@ -413,6 +480,38 @@ mod tests {
         assert!(matches!(
             infer_persistence_strength("generic_rule", ["autostart"]),
             RuleStrength::GenericPrimitive
+        ));
+    }
+
+    #[test]
+    fn infer_persistence_strength_repeated_hints_do_not_toggle_matches_off() {
+        assert!(matches!(
+            infer_persistence_strength("ld_preload_rule", ["ldpreload", "cron"]),
+            RuleStrength::CombinedSuspiciousPrimitives
+        ));
+        assert!(matches!(
+            infer_persistence_strength("cron_rule", ["crontab", "systemd"]),
+            RuleStrength::CombinedSuspiciousPrimitives
+        ));
+        assert!(matches!(
+            infer_persistence_strength("systemd_rule", ["service", "bashrc"]),
+            RuleStrength::CombinedSuspiciousPrimitives
+        ));
+        assert!(matches!(
+            infer_persistence_strength("profile_rule", ["autostart", "cron"]),
+            RuleStrength::CombinedSuspiciousPrimitives
+        ));
+    }
+
+    #[test]
+    fn infer_persistence_strength_counts_systemctl_and_service_as_systemd_hints() {
+        assert!(matches!(
+            infer_persistence_strength("systemctl_rule", ["cron"]),
+            RuleStrength::CombinedSuspiciousPrimitives
+        ));
+        assert!(matches!(
+            infer_persistence_strength("service_rule", ["ldpreload"]),
+            RuleStrength::CombinedSuspiciousPrimitives
         ));
     }
 

@@ -1742,6 +1742,7 @@ mod tests {
 
         assert!(rendered.contains("[malicious] payload.bin"));
         assert!(rendered.contains("score: 100"));
+        assert!(rendered.contains("findings:"));
         assert!(rendered.contains("known hash"));
         assert!(rendered.contains("confidence high"));
     }
@@ -1753,6 +1754,14 @@ mod tests {
 
         assert!(matches!(
             detect_archive_kind(b"PK\x03\x04anything").unwrap(),
+            ArchiveKind::Zip
+        ));
+        assert!(matches!(
+            detect_archive_kind(b"PK\x05\x06empty zip").unwrap(),
+            ArchiveKind::Zip
+        ));
+        assert!(matches!(
+            detect_archive_kind(b"PK\x07\x08spanned zip").unwrap(),
             ArchiveKind::Zip
         ));
         assert!(matches!(
@@ -2191,6 +2200,42 @@ mod tests {
     }
 
     #[test]
+    fn scan_one_and_report_combines_hash_and_yara_findings_for_same_file() {
+        let rules = compile_rules(
+            r#"
+            rule EICAR_Combined_File_Test {
+                strings:
+                    $marker = "combined-file-marker"
+                condition:
+                    $marker
+            }
+            "#,
+        );
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let payload = b"prefix combined-file-marker suffix with enough bytes";
+        let (_database_file, database) = hash_database_for_payload(payload);
+        let mut summary = ScanSummaryStats::new();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), payload).unwrap();
+
+        scan_one_and_report(file.path(), &database, &mut scanner, &mut summary);
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.filesystem_files_scanned, 1);
+        assert_eq!(summary.known_hash_detections, 1);
+        assert_eq!(summary.yara_detections, 1);
+        assert_eq!(summary.yara_rules_triggered["EICAR_Combined_File_Test"], 1);
+        assert_eq!(summary.detections.len(), 1);
+        assert_eq!(summary.detections[0].score, 180);
+        assert_eq!(summary.detections[0].verdict, Verdict::Malicious);
+        assert_eq!(
+            summary.detections[0].surface,
+            DetectionSurface::FileSystemFile
+        );
+        assert_eq!(summary.detections[0].findings.iter().flatten().count(), 2);
+    }
+
+    #[test]
     fn scan_one_and_report_counts_error_for_malformed_archive_container() {
         let rules = non_matching_rules();
         let mut scanner = yara_x::Scanner::new(&rules);
@@ -2325,6 +2370,49 @@ mod tests {
             DetectionSurface::ArchiveEntry
         );
         assert_eq!(summary.detections[0].verdict, Verdict::LikelyMalicious);
+    }
+
+    #[test]
+    fn scan_bytes_combines_hash_and_yara_findings_for_archive_entry() {
+        let rules = compile_rules(
+            r#"
+            rule EICAR_Combined_Entry_Test {
+                strings:
+                    $marker = "combined-entry-marker"
+                condition:
+                    $marker
+            }
+            "#,
+        );
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let payload = b"prefix combined-entry-marker suffix with enough bytes";
+        let (_database_file, database) = hash_database_for_payload(payload);
+        let mut summary = ScanSummaryStats::new();
+        let mut archive_state = ArchiveScanState::new(0);
+
+        scan_bytes_with_state(
+            Path::new("archive.zip!/combined.bin"),
+            payload,
+            &database,
+            &mut scanner,
+            &mut summary,
+            &mut archive_state,
+        )
+        .unwrap();
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert_eq!(summary.known_hash_detections, 1);
+        assert_eq!(summary.yara_detections, 1);
+        assert_eq!(summary.yara_rules_triggered["EICAR_Combined_Entry_Test"], 1);
+        assert_eq!(summary.detections.len(), 1);
+        assert_eq!(summary.detections[0].score, 180);
+        assert_eq!(summary.detections[0].verdict, Verdict::Malicious);
+        assert_eq!(
+            summary.detections[0].surface,
+            DetectionSurface::ArchiveEntry
+        );
+        assert_eq!(summary.detections[0].findings.iter().flatten().count(), 2);
     }
 
     #[test]

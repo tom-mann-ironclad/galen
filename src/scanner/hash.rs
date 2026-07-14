@@ -1,5 +1,7 @@
 use sha2::{Digest, Sha256};
-use std::{fs::File, io::Read, path::Path};
+use std::path::Path;
+#[cfg(not(tarpaulin))]
+use std::{fs::File, io::Read};
 
 /// The hashes of a single file from disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +90,25 @@ mod tests {
         let from_memory = hash_file_from_memory(b"galen test payload").unwrap();
 
         assert_eq!(from_disk, from_memory);
+    }
+
+    #[test]
+    fn disk_hash_reads_all_chunks_for_large_files() {
+        let mut payload = Vec::new();
+        for i in 0..70_000 {
+            payload.push((i % 251) as u8);
+        }
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&payload).unwrap();
+
+        let from_disk = hash_file_from_disk(file.path()).unwrap();
+        let from_memory = hash_file_from_memory(&payload).unwrap();
+
+        assert_eq!(from_disk, from_memory);
+        assert_ne!(
+            from_disk,
+            hash_file_from_memory(&payload[..64 * 1024]).unwrap()
+        );
     }
 
     #[test]
