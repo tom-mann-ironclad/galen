@@ -12,7 +12,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  regression:
+    name: Full regression
+    uses: ./.github/workflows/regression.yaml
+
   deploy-nightly:
+    needs: [regression]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code

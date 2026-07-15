@@ -1,0 +1,59 @@
+name: Regression
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  distro-regression:
+    name: Full regression (${{ matrix.distro.name }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.distro.image }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - name: Debian
+            image: debian:stable
+          - name: Fedora
+            image: fedora:latest
+          - name: Arch
+            image: archlinux:latest
+
+    steps:
+      - name: Install distro dependencies
+        run: |
+          case "${{ matrix.distro.name }}" in
+            Debian)
+              apt-get update
+              apt-get install -y --no-install-recommends ca-certificates git
+              ;;
+            Fedora)
+              dnf install -y ca-certificates git
+              ;;
+            Arch)
+              pacman -Syu --noconfirm
+              pacman -S --noconfirm ca-certificates git
+              ;;
+          esac
+
+      - uses: actions/checkout@v7
+
+      - name: Install regression dependencies
+        run: scripts/ci/install-regression-deps.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Run full regression suite
+        env:
+          GALEN_BIN: target/release/galen
+          GALEN_REGRESSION_MODE: full
+        run: cargo test --locked --test regression -- --ignored --nocapture

@@ -283,6 +283,7 @@ mod tests {
         summary.archive_entries_scanned = 1;
         summary.archives_scanned = 1;
         summary.record_skip(SkipReason::ZeroSize);
+        summary.record_skip(SkipReason::PermissionDenied);
         summary.detections = vec![
             detection("sample.zip", DetectionSurface::ArchiveContainer, 90),
             detection("sample.zip!/payload", DetectionSurface::ArchiveEntry, 90),
@@ -300,6 +301,7 @@ mod tests {
         assert_eq!(report.visible_detections[0].path, "sample.zip!/payload");
         assert_eq!(report.suppressed_detections[0].path, "sample.zip");
         assert_eq!(report.summary.skips[0].reason, "zero_size");
+        assert_eq!(report.summary.skips[1].reason, "permission_denied");
         assert_eq!(
             report
                 .summary

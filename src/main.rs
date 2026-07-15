@@ -588,6 +588,7 @@ mod tests {
         summary.filesystem_files_scanned = 1;
         summary.archive_entries_scanned = 1;
         summary.record_skip(SkipReason::ZeroSize);
+        summary.record_skip(SkipReason::PermissionDenied);
         summary.detections = vec![
             detection(
                 "payload.bin",
@@ -607,8 +608,9 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
 
         assert_eq!(exit_code, EXIT_DETECTIONS);
-        assert!(output.contains("Skipped 1 files"));
+        assert!(output.contains("Skipped 2 files"));
         assert!(output.contains("zero-size: 1"));
+        assert!(output.contains("permission denied: 1"));
         assert!(output.contains("Detection records: 2"));
         assert!(output.contains("filesystem file: 1"));
         assert!(output.contains("archive entry: 1"));

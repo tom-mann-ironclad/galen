@@ -1,5 +1,11 @@
 # Galen
 
+[![CI](https://github.com/tom-mann-ironclad/galen/actions/workflows/ci.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/ci.yaml)
+[![Nightly Packages](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml)
+[![Code Coverage]](https://img.shields.io/badge/coverage-81.4%25-green)
+[![Mutation Coverage]](https://img.shields.io/badge/coverage-80.3%25-green)
+![GitHub License](https://img.shields.io/github/license/tom-mann-ironclad/galen)
+
 Galen is an experimental Rust security intelligence and scanning pipeline for Linux.
 
 It combines local hash-based detection, YARA rule scanning, archive inspection, and lightweight heuristics into a fast command-line scanner designed to be understandable, resource-conscious, and operator-friendly.
@@ -235,7 +241,6 @@ Galen should not currently be treated as a production anti-malware replacement.
 
 Known limitations include:
 
-* Test coverage is still incomplete (~81.5% code coverage with a ~80.1% mutation coverage)
 * Configuration support is still limited
 * No packaged `.deb` or `.rpm` stable release yet (although nightly is available)
 * Limited CI/CD pipeline

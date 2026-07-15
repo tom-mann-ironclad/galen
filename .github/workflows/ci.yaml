@@ -34,6 +34,12 @@ jobs:
       - name: Build snapshot binary
         run: cargo build --release --locked
 
+      - name: Run smoke regression suite
+        env:
+          GALEN_BIN: target/release/galen
+          GALEN_REGRESSION_MODE: smoke
+        run: cargo test --locked --test regression -- --ignored --nocapture
+
       - name: Prepare snapshot artifact
         run: |
           set -euo pipefail

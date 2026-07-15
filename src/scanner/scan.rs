@@ -7,7 +7,7 @@ use super::{
     hash::{FileHashes, hash_file_from_disk, hash_file_from_memory},
 };
 use std::collections::HashMap;
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
 const MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE: u64 = 64 * 1024 * 1024;
@@ -125,10 +125,11 @@ pub enum SkipReason {
     ArchiveReadError,
     EncryptedFile,
     FileIsSymLink,
+    PermissionDenied,
 }
 
 impl SkipReason {
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
 
     pub fn as_index(self) -> usize {
         match self {
@@ -142,6 +143,7 @@ impl SkipReason {
             SkipReason::ArchiveReadError => 7,
             SkipReason::EncryptedFile => 8,
             SkipReason::FileIsSymLink => 9,
+            SkipReason::PermissionDenied => 10,
         }
     }
 
@@ -157,6 +159,7 @@ impl SkipReason {
             SkipReason::ArchiveReadError => "archive read error",
             SkipReason::EncryptedFile => "file encrypted",
             SkipReason::FileIsSymLink => "file is symlink",
+            SkipReason::PermissionDenied => "permission denied",
         }
     }
 
@@ -172,6 +175,7 @@ impl SkipReason {
             SkipReason::ArchiveReadError => "archive_read_error",
             SkipReason::EncryptedFile => "file_encrypted",
             SkipReason::FileIsSymLink => "file_is_symlink",
+            SkipReason::PermissionDenied => "permission_denied",
         }
     }
 
@@ -186,6 +190,7 @@ impl SkipReason {
         SkipReason::ArchiveReadError,
         SkipReason::EncryptedFile,
         SkipReason::FileIsSymLink,
+        SkipReason::PermissionDenied,
     ];
 }
 
@@ -409,6 +414,15 @@ fn scan_file_yara_from_memory(
     })
 }
 
+/// Check whether a filesystem file can be opened for reading.
+fn can_read_file(path: &Path) -> Result<bool, std::io::Error> {
+    match std::fs::File::open(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 /// Function to scan a file and report the results by modifying the provided summary.
 fn scan_one_and_report(
     path: &Path,
@@ -437,6 +451,24 @@ fn scan_one_and_report(
     if metadata.len() == 0 {
         summary.record_skip(SkipReason::ZeroSize);
         return;
+    }
+
+    match can_read_file(path) {
+        Ok(true) => {}
+        Ok(false) => {
+            summary.record_skip(SkipReason::PermissionDenied);
+            eprintln!("Skipping {}: permission denied", path.display());
+            return;
+        }
+        Err(err) => {
+            summary.errors += 1;
+            eprintln!(
+                "Could not check read permission for {}: {}",
+                path.display(),
+                err
+            );
+            return;
+        }
     }
 
     // Hash the file and compare
@@ -595,6 +627,11 @@ fn scan_directory(
 ) {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            summary.record_skip(SkipReason::PermissionDenied);
+            eprintln!("Skipping {}: permission denied", directory.display());
+            return;
+        }
         Err(err) => {
             summary.errors += 1;
             eprintln!(
@@ -606,9 +643,36 @@ fn scan_directory(
         }
     };
 
+    scan_directory_entry_paths(
+        directory,
+        entries.map(|entry| entry.map(|entry| entry.path())),
+        hash_database,
+        yara_scanner,
+        summary,
+    );
+}
+
+/// Function to scan directory entry paths and handle per-entry filesystem errors.
+fn scan_directory_entry_paths<I>(
+    directory: &Path,
+    entries: I,
+    hash_database: &HashDatabase,
+    yara_scanner: &mut yara_x::Scanner,
+    summary: &mut ScanSummaryStats,
+) where
+    I: IntoIterator<Item = Result<PathBuf, std::io::Error>>,
+{
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
+        let path = match entry {
+            Ok(path) => path,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                summary.record_skip(SkipReason::PermissionDenied);
+                eprintln!(
+                    "Skipping directory entry in {}: permission denied",
+                    directory.display()
+                );
+                continue;
+            }
             Err(err) => {
                 summary.errors += 1;
                 eprintln!(
@@ -620,9 +684,13 @@ fn scan_directory(
             }
         };
 
-        let path = entry.path();
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                summary.record_skip(SkipReason::PermissionDenied);
+                eprintln!("Skipping {}: permission denied", path.display());
+                continue;
+            }
             Err(err) => {
                 summary.errors += 1;
                 eprintln!("Unable to read metadata for {}: {}", path.display(), err);
@@ -1327,7 +1395,7 @@ mod tests {
     use flate2::{Compression, write::GzEncoder};
     use std::io::{Read, Write};
     #[cfg(unix)]
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
 
     fn compile_rules(source: &str) -> yara_x::Rules {
@@ -1480,6 +1548,14 @@ mod tests {
         }
     }
 
+    /// Set Unix filesystem permissions for a test fixture.
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(mode);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
     #[test]
     fn archive_path_for_simple_zip_entry() {
         let path = make_archive_path(Path::new("./corpus/eicar.zip"), Path::new("eicar.com"));
@@ -1608,10 +1684,12 @@ mod tests {
         summary.record_skip(SkipReason::ZeroSize);
         summary.record_skip(SkipReason::ZeroSize);
         summary.record_skip(SkipReason::EncryptedFile);
+        summary.record_skip(SkipReason::PermissionDenied);
 
-        assert_eq!(summary.files_skipped, 3);
+        assert_eq!(summary.files_skipped, 4);
         assert_eq!(summary.skip_count(SkipReason::ZeroSize), 2);
         assert_eq!(summary.skip_count(SkipReason::EncryptedFile), 1);
+        assert_eq!(summary.skip_count(SkipReason::PermissionDenied), 1);
         assert_eq!(summary.skip_count(SkipReason::MalformedArchive), 0);
     }
 
@@ -1663,6 +1741,11 @@ mod tests {
                 SkipReason::FileIsSymLink,
                 "file is symlink",
                 "file_is_symlink",
+            ),
+            (
+                SkipReason::PermissionDenied,
+                "permission denied",
+                "permission_denied",
             ),
         ];
 
@@ -1792,12 +1875,20 @@ mod tests {
 
     #[test]
     fn read_limited_into_errors_and_clears_output_when_limit_is_exceeded() {
+        let mut boundary_input = std::io::Cursor::new(b"abcde");
+        let mut boundary_output = vec![1, 2, 3];
+
+        read_limited_into(&mut boundary_input, &mut boundary_output, 5).unwrap();
+
+        assert_eq!(boundary_output, b"abcde");
+
         let mut input = std::io::Cursor::new(b"abcdef");
         let mut output = vec![1, 2, 3];
 
         let err = read_limited_into(&mut input, &mut output, 5).unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "archive entry exceeded memory limit");
         assert!(output.is_empty());
     }
 
@@ -1873,6 +1964,38 @@ mod tests {
             .expect("memory hashing should succeed");
 
         assert!(matches!(result, HashScanResult::Clean));
+    }
+
+    #[test]
+    fn can_read_file_reports_existing_files_as_readable() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"readable").unwrap();
+
+        let readable = can_read_file(file.path()).unwrap();
+
+        assert!(readable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn can_read_file_reports_permission_denied_as_not_readable() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"unreadable").unwrap();
+        set_mode(file.path(), 0o000);
+
+        let readable = can_read_file(file.path()).unwrap();
+
+        set_mode(file.path(), 0o600);
+        assert!(!readable);
+    }
+
+    #[test]
+    fn can_read_file_reports_missing_paths_as_errors() {
+        let target = tempfile::tempdir().unwrap().path().join("missing.bin");
+
+        let err = can_read_file(&target).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -2023,6 +2146,118 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn scan_directory_skips_unreadable_child_directory_without_error() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let root = tempfile::tempdir().unwrap();
+        let unreadable = root.path().join("unreadable");
+        std::fs::create_dir(&unreadable).unwrap();
+        std::fs::write(root.path().join("readable.bin"), b"readable").unwrap();
+        set_mode(&unreadable, 0o000);
+
+        let summary = scan_path(root.path(), &database, &mut scanner);
+
+        set_mode(&unreadable, 0o700);
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.skip_count(SkipReason::PermissionDenied), 1);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.filesystem_files_scanned, 1);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_directory_skips_permission_denied_entry_without_error() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let entries = vec![Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "synthetic directory entry error",
+        ))];
+
+        scan_directory_entry_paths(
+            Path::new("synthetic"),
+            entries,
+            &database,
+            &mut scanner,
+            &mut summary,
+        );
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.skip_count(SkipReason::PermissionDenied), 1);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.total_files_scanned(), 0);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_directory_skips_nested_file_when_metadata_permission_denied_without_error() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let root = tempfile::tempdir().unwrap();
+        let restricted = root.path().join("restricted");
+        let nested_file = restricted.join("nested.bin");
+        std::fs::create_dir(&restricted).unwrap();
+        std::fs::write(&nested_file, b"nested").unwrap();
+        set_mode(&restricted, 0o400);
+
+        let metadata_probe = std::fs::symlink_metadata(&nested_file);
+        let summary = scan_path(root.path(), &database, &mut scanner);
+
+        set_mode(&restricted, 0o700);
+        assert_eq!(
+            metadata_probe.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.skip_count(SkipReason::PermissionDenied), 1);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.total_files_scanned(), 0);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_directory_reports_missing_directory_as_error() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let target = tempfile::tempdir().unwrap().path().join("missing");
+
+        scan_directory(&target, &database, &mut scanner, &mut summary);
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.files_skipped, 0);
+        assert_eq!(summary.total_files_scanned(), 0);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_directory_skips_unreadable_root_directory_without_error() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let root = tempfile::tempdir().unwrap();
+        set_mode(root.path(), 0o000);
+
+        scan_directory(root.path(), &database, &mut scanner, &mut summary);
+
+        set_mode(root.path(), 0o700);
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.skip_count(SkipReason::PermissionDenied), 1);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.total_files_scanned(), 0);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn scan_path_ignores_symlinked_directory_entries() {
         let rules = non_matching_rules();
         let mut scanner = yara_x::Scanner::new(&rules);
@@ -2137,6 +2372,27 @@ mod tests {
         scan_one_and_report(&target, &database, &mut scanner, &mut summary);
 
         assert_eq!(summary.errors, 1);
+        assert_eq!(summary.total_files_scanned(), 0);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_one_and_report_skips_permission_denied_file_without_error() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"unreadable file with enough bytes").unwrap();
+        set_mode(file.path(), 0o000);
+
+        scan_one_and_report(file.path(), &database, &mut scanner, &mut summary);
+
+        set_mode(file.path(), 0o600);
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.skip_count(SkipReason::PermissionDenied), 1);
+        assert_eq!(summary.files_skipped, 1);
         assert_eq!(summary.total_files_scanned(), 0);
         assert!(summary.detections.is_empty());
     }
@@ -2441,6 +2697,32 @@ mod tests {
     }
 
     #[test]
+    fn scan_bytes_records_error_for_malformed_nested_tar_but_counts_container_entry() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let mut malformed_tar = [0_u8; 512];
+        malformed_tar[257..263].copy_from_slice(b"ustar\0");
+        let mut archive_state = ArchiveScanState::new(0);
+
+        scan_bytes_with_state(
+            Path::new("outer.zip!/bad.tar"),
+            &malformed_tar,
+            &database,
+            &mut scanner,
+            &mut summary,
+            &mut archive_state,
+        )
+        .unwrap();
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 1);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
     fn scan_bytes_records_error_for_malformed_nested_gzip_but_counts_container_entry() {
         let rules = non_matching_rules();
         let mut scanner = yara_x::Scanner::new(&rules);
@@ -2463,6 +2745,56 @@ mod tests {
         assert_eq!(summary.errors, 1);
         assert_eq!(summary.archives_scanned, 1);
         assert_eq!(summary.archive_entries_scanned, 1);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_bytes_dispatches_nested_tar_archive_and_counts_container_entry() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let archive = tar_bytes(&[("payload.bin", b"nested tar payload")]);
+        let mut archive_state = ArchiveScanState::new(0);
+
+        scan_bytes_with_state(
+            Path::new("outer.zip!/nested.tar"),
+            &archive,
+            &database,
+            &mut scanner,
+            &mut summary,
+            &mut archive_state,
+        )
+        .unwrap();
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 2);
+        assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_bytes_dispatches_nested_gzip_archive_and_counts_container_entry() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let compressed = gzip_bytes(b"nested gzip payload");
+        let mut archive_state = ArchiveScanState::new(0);
+
+        scan_bytes_with_state(
+            Path::new("outer.zip!/nested.gz"),
+            &compressed,
+            &database,
+            &mut scanner,
+            &mut summary,
+            &mut archive_state,
+        )
+        .unwrap();
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 2);
         assert!(summary.detections.is_empty());
     }
 

@@ -287,7 +287,8 @@
         "unsupported_archive",
         "archive_read_error",
         "file_encrypted",
-        "file_is_symlink"
+        "file_is_symlink",
+        "permission_denied"
       ]
     },
     "detection_surface": {

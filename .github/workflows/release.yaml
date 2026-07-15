@@ -11,8 +11,13 @@ permissions:
   id-token: write
 
 jobs:
+  regression:
+    name: Full regression
+    uses: ./.github/workflows/regression.yaml
+
   build:
     name: Build alpha release
+    needs: [regression]
     runs-on: ubuntu-latest
 
     permissions:
