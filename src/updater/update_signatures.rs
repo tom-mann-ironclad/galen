@@ -2,7 +2,7 @@ use rusqlite::{Connection, params};
 use serde::Deserialize;
 #[cfg(not(tarpaulin))]
 use std::io::{BufReader, Seek, SeekFrom, copy};
-use std::{io::BufRead, path::Path};
+use std::{fmt, io::BufRead, path::Path};
 
 const CREATE_METADATA_TABLE: &str = r#"
         CREATE TABLE IF NOT EXISTS update_metadata (
@@ -37,13 +37,40 @@ struct MalwareBazaarSample {
     file_type: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateSignaturesError {
+    DatabaseSetup(String),
+    DatabaseCount(String),
+    FullFetch(String),
+    RecentFetch(String),
+    DatabaseInsert(String),
+    NetworkUpdateDisabled,
+}
+
+impl fmt::Display for UpdateSignaturesError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UpdateSignaturesError::DatabaseSetup(err)
+            | UpdateSignaturesError::DatabaseCount(err)
+            | UpdateSignaturesError::FullFetch(err)
+            | UpdateSignaturesError::RecentFetch(err)
+            | UpdateSignaturesError::DatabaseInsert(err) => write!(formatter, "{err}"),
+            UpdateSignaturesError::NetworkUpdateDisabled => {
+                write!(formatter, "network update disabled during coverage")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UpdateSignaturesError {}
+
 /// Function to update the signatures database from Malware Bazaar.
 #[cfg(not(tarpaulin))]
 pub fn update_signatures_using_malware_bazaar(
     auth_key: &str,
     selector: &str,
     db_path: impl AsRef<Path>,
-) -> Result<usize, String> {
+) -> Result<usize, UpdateSignaturesError> {
     update_signatures_with_client(
         auth_key,
         selector,
@@ -93,11 +120,12 @@ fn update_signatures_with_client(
     selector: &str,
     db_path: &Path,
     client: &impl MalwareBazaarClient,
-) -> Result<usize, String> {
-    create_database_tables(db_path).map_err(|err| err.to_string())?;
+) -> Result<usize, UpdateSignaturesError> {
+    create_database_tables(db_path)
+        .map_err(|err| UpdateSignaturesError::DatabaseSetup(err.to_string()))?;
     let existing_entries = match malware_hash_count(db_path) {
         Ok(count) => count,
-        Err(err) => return Err(err.to_string()),
+        Err(err) => return Err(UpdateSignaturesError::DatabaseCount(err.to_string())),
     };
 
     // If we have no malware signatures we need to bootstrap the database.
@@ -105,20 +133,20 @@ fn update_signatures_with_client(
         eprintln!("Empty database found, bootstrapping...");
         match client.fetch_full(auth_key, db_path) {
             Ok(count) => return Ok(count),
-            Err(err) => return Err(err.to_string()),
+            Err(err) => return Err(UpdateSignaturesError::FullFetch(err.to_string())),
         }
     }
 
     let samples = match client.fetch_recent(auth_key, selector) {
         Ok(samples) => samples,
-        Err(err) => return Err(err.to_string()),
+        Err(err) => return Err(UpdateSignaturesError::RecentFetch(err.to_string())),
     };
 
     if !samples.is_empty() {
         eprintln!("Updating database with latest signatures...");
         match insert_malware_bazaar_hashes(db_path, &samples) {
             Ok(inserted) => return Ok(inserted),
-            Err(err) => return Err(err.to_string()),
+            Err(err) => return Err(UpdateSignaturesError::DatabaseInsert(err.to_string())),
         }
     }
 
@@ -130,8 +158,8 @@ pub fn update_signatures_using_malware_bazaar(
     _auth_key: &str,
     _selector: &str,
     _db_path: impl AsRef<Path>,
-) -> Result<usize, String> {
-    Err("network update disabled during coverage".to_string())
+) -> Result<usize, UpdateSignaturesError> {
+    Err(UpdateSignaturesError::NetworkUpdateDisabled)
 }
 
 /// Function to ensure that all required database tables exist.
@@ -639,7 +667,10 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
             update_signatures_with_client("auth", "selector", empty.path(), &full_error_client)
                 .unwrap_err();
 
-        assert_eq!(err, "full failed");
+        assert_eq!(
+            err,
+            UpdateSignaturesError::FullFetch("full failed".to_string())
+        );
 
         let existing = tempfile::NamedTempFile::new().unwrap();
         create_database_tables(existing.path()).unwrap();
@@ -658,6 +689,53 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
         )
         .unwrap_err();
 
-        assert_eq!(err, "recent failed");
+        assert_eq!(
+            err,
+            UpdateSignaturesError::RecentFetch("recent failed".to_string())
+        );
+    }
+
+    #[test]
+    fn update_signatures_error_display_messages_are_stable() {
+        let cases = [
+            (
+                UpdateSignaturesError::DatabaseSetup("setup failed".to_string()),
+                "setup failed",
+            ),
+            (
+                UpdateSignaturesError::DatabaseCount("count failed".to_string()),
+                "count failed",
+            ),
+            (
+                UpdateSignaturesError::FullFetch("full failed".to_string()),
+                "full failed",
+            ),
+            (
+                UpdateSignaturesError::RecentFetch("recent failed".to_string()),
+                "recent failed",
+            ),
+            (
+                UpdateSignaturesError::DatabaseInsert("insert failed".to_string()),
+                "insert failed",
+            ),
+            (
+                UpdateSignaturesError::NetworkUpdateDisabled,
+                "network update disabled during coverage",
+            ),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+        }
+    }
+
+    #[cfg(tarpaulin)]
+    #[test]
+    fn update_signatures_using_malware_bazaar_reports_disabled_update_under_coverage() {
+        let err =
+            update_signatures_using_malware_bazaar("auth", "100", Path::new("signatures.sqlite"))
+                .unwrap_err();
+
+        assert_eq!(err, UpdateSignaturesError::NetworkUpdateDisabled);
     }
 }

@@ -220,6 +220,13 @@ mod tests {
         compiler.build()
     }
 
+    fn assert_rule_class(actual: YaraRuleClass, expected: YaraRuleClass, name: &str) {
+        assert!(
+            std::mem::discriminant(&actual) == std::mem::discriminant(&expected),
+            "{name}: got {actual:?}, expected {expected:?}"
+        );
+    }
+
     #[test]
     fn load_yara_rules_cache_reads_serialized_rules_and_reports_missing_files() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -250,6 +257,58 @@ mod tests {
             classify_yara_rule("generic_rule", ["upx"], []),
             YaraRuleClass::PackerOrObfuscation
         ));
+    }
+
+    #[test]
+    fn classify_yara_rule_recognizes_all_persistence_identifier_hints() {
+        for hint in ["ldpreload", "ld_preload", "systemd", "cron", "persistence"] {
+            let identifier = format!("linux_{hint}_rule");
+
+            let class = classify_yara_rule(&identifier, [], []);
+
+            assert_rule_class(class, YaraRuleClass::Persistence, hint);
+        }
+    }
+
+    #[test]
+    fn classify_yara_rule_recognizes_all_credential_identifier_hints() {
+        for hint in [
+            "credential",
+            "password",
+            "keylogger",
+            "stealer",
+            "infostealer",
+        ] {
+            let identifier = format!("linux_{hint}_rule");
+
+            let class = classify_yara_rule(&identifier, [], []);
+
+            assert_rule_class(class, YaraRuleClass::CredentialAccess, hint);
+        }
+    }
+
+    #[test]
+    fn classify_yara_rule_recognizes_all_persistence_tag_hints() {
+        for hint in ["ldpreload", "ld_preload", "systemd", "cron", "persistence"] {
+            let class = classify_yara_rule("generic_rule", [hint], []);
+
+            assert_rule_class(class, YaraRuleClass::Persistence, hint);
+        }
+    }
+
+    #[test]
+    fn classify_yara_rule_recognizes_all_credential_tag_hints() {
+        for hint in [
+            "credential",
+            "password",
+            "keylogger",
+            "stealer",
+            "infostealer",
+        ] {
+            let class = classify_yara_rule("generic_rule", [hint], []);
+
+            assert_rule_class(class, YaraRuleClass::CredentialAccess, hint);
+        }
     }
 
     #[test]
@@ -350,10 +409,7 @@ mod tests {
 
         for (name, identifier, tags, metadata_keys, expected) in cases {
             let class = classify_yara_rule(identifier, tags, metadata_keys);
-            assert!(
-                std::mem::discriminant(&class) == std::mem::discriminant(&expected),
-                "{name}: got {class:?}, expected {expected:?}"
-            );
+            assert_rule_class(class, expected, name);
         }
     }
 
@@ -433,10 +489,7 @@ mod tests {
 
         for (name, tags, expected) in cases {
             let class = classify_yara_rule("generic_rule", tags.iter().copied(), []);
-            assert!(
-                std::mem::discriminant(&class) == std::mem::discriminant(&expected),
-                "{name}: got {class:?}, expected {expected:?}"
-            );
+            assert_rule_class(class, expected, name);
         }
     }
 

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{env::VarError, fmt, path::PathBuf};
 
 const DEFAULT_DATABASE: &str = "./signature_database.sqlite";
 const DEFAULT_YARA_DIR: &str = "./yara/";
@@ -42,6 +42,36 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Errors produced while parsing command-line arguments.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CliError {
+    NoArgumentsProvided,
+    UnknownCommand,
+    UnknownArgumentProvided,
+    MultipleScanTargetsProvided,
+    NoScanTargetProvided,
+    UnknownParameterProvided,
+    AuthKeyEnvironment(VarError),
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CliError::NoArgumentsProvided => write!(formatter, "No arguments provided"),
+            CliError::UnknownCommand => write!(formatter, "Unknown command"),
+            CliError::UnknownArgumentProvided => write!(formatter, "Unknown argument provided"),
+            CliError::MultipleScanTargetsProvided => {
+                write!(formatter, "Multiple scan targets provided")
+            }
+            CliError::NoScanTargetProvided => write!(formatter, "No scan target provided"),
+            CliError::UnknownParameterProvided => write!(formatter, "Unknown parameter provided"),
+            CliError::AuthKeyEnvironment(err) => write!(formatter, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for CliError {}
+
 impl From<String> for OutputFormat {
     fn from(string: String) -> OutputFormat {
         match string.as_str() {
@@ -52,7 +82,7 @@ impl From<String> for OutputFormat {
 }
 
 /// Function to parse the arguments passed to the CLI.
-pub fn parse_args<I>(args: I) -> Result<Command, String>
+pub fn parse_args<I>(args: I) -> Result<Command, CliError>
 where
     I: IntoIterator<Item = String>,
 {
@@ -62,19 +92,19 @@ where
     let _program = args.next();
 
     let Some(command) = args.next() else {
-        return Err("No arguments provided".to_string());
+        return Err(CliError::NoArgumentsProvided);
     };
 
     match command.as_str() {
         "scan" => parse_scan(args),
         "update" => parse_update(args),
         "--help" | "-h" | "help" => Ok(Command::Help),
-        _other => Err("Unknown command".to_string()),
+        _other => Err(CliError::UnknownCommand),
     }
 }
 
 /// Function to parse the arguments of a scan command.
-fn parse_scan<I>(args: I) -> Result<Command, String>
+fn parse_scan<I>(args: I) -> Result<Command, CliError>
 where
     I: IntoIterator<Item = String>,
 {
@@ -89,7 +119,7 @@ where
         match arg.as_str() {
             "--database" | "-d" => {
                 let Some(value) = args.next() else {
-                    return Err("No arguments provided".to_string());
+                    return Err(CliError::NoArgumentsProvided);
                 };
 
                 database = PathBuf::from(value);
@@ -97,26 +127,26 @@ where
 
             "--yara-cache" | "-y" => {
                 let Some(value) = args.next() else {
-                    return Err("No arguments provided".to_string());
+                    return Err(CliError::NoArgumentsProvided);
                 };
                 yara_rules_cache = PathBuf::from(value);
             }
 
             "--output" | "-o" => {
                 let Some(value) = args.next() else {
-                    return Err("No arguments provided".to_string());
+                    return Err(CliError::NoArgumentsProvided);
                 };
                 output_format = OutputFormat::from(value);
             }
 
             value if value.starts_with("-") => {
-                return Err("Unknown argument provided".to_string());
+                return Err(CliError::UnknownArgumentProvided);
             }
 
             value => {
                 // Guard to only allow a single target
                 if target.is_some() {
-                    return Err("Multiple scan targets provided".to_string());
+                    return Err(CliError::MultipleScanTargetsProvided);
                 }
 
                 target = Some(PathBuf::from(value));
@@ -126,7 +156,7 @@ where
 
     // Only accept scan commands which contain a target
     let Some(target) = target else {
-        return Err("No scan target provided".to_string());
+        return Err(CliError::NoScanTargetProvided);
     };
 
     Ok(Command::Scan(ScanArgs {
@@ -137,13 +167,13 @@ where
     }))
 }
 
-fn parse_update<I>(args: I) -> Result<Command, String>
+fn parse_update<I>(args: I) -> Result<Command, CliError>
 where
     I: IntoIterator<Item = String>,
 {
     let auth_key = match std::env::var("GALEN_AUTH_KEY") {
         Ok(key) => key,
-        Err(err) => return Err(err.to_string()),
+        Err(err) => return Err(CliError::AuthKeyEnvironment(err)),
     };
     let mut args = args.into_iter();
 
@@ -151,7 +181,7 @@ where
         // Guard to catch invalid parameters
         let _value = arg.as_str();
         {
-            return Err("Unknown parameter provided".to_string());
+            return Err(CliError::UnknownParameterProvided);
         }
     }
 
@@ -239,7 +269,7 @@ mod tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
-    fn parse_error(values: &[&str]) -> String {
+    fn parse_error(values: &[&str]) -> CliError {
         match parse_args(args(values)) {
             Ok(_) => panic!("expected parse error"),
             Err(err) => err,
@@ -317,15 +347,18 @@ mod tests {
             Command::Help
         ));
 
-        assert_eq!(parse_error(&["galen", "unknown"]), "Unknown command");
+        assert_eq!(parse_error(&["galen", "unknown"]), CliError::UnknownCommand);
     }
 
     #[test]
     fn parse_scan_rejects_missing_and_duplicate_targets() {
-        assert_eq!(parse_error(&["galen", "scan"]), "No scan target provided");
+        assert_eq!(
+            parse_error(&["galen", "scan"]),
+            CliError::NoScanTargetProvided
+        );
         assert_eq!(
             parse_error(&["galen", "scan", "one", "two"]),
-            "Multiple scan targets provided"
+            CliError::MultipleScanTargetsProvided
         );
     }
 
@@ -333,19 +366,19 @@ mod tests {
     fn parse_scan_rejects_unknown_flags_and_missing_values() {
         assert_eq!(
             parse_error(&["galen", "scan", "--unknown", "target"]),
-            "Unknown argument provided"
+            CliError::UnknownArgumentProvided
         );
         assert_eq!(
             parse_error(&["galen", "scan", "--database"]),
-            "No arguments provided"
+            CliError::NoArgumentsProvided
         );
         assert_eq!(
             parse_error(&["galen", "scan", "--yara-cache"]),
-            "No arguments provided"
+            CliError::NoArgumentsProvided
         );
         assert_eq!(
             parse_error(&["galen", "scan", "--output"]),
-            "No arguments provided"
+            CliError::NoArgumentsProvided
         );
     }
 
@@ -379,7 +412,7 @@ mod tests {
 
         assert_eq!(
             parse_error(&["galen", "update", "--database", "custom.sqlite"]),
-            "Unknown parameter provided"
+            CliError::UnknownParameterProvided
         );
     }
 
@@ -389,6 +422,7 @@ mod tests {
 
         let err = parse_error(&["galen", "update"]);
 
-        assert!(err.contains("environment variable not found"));
+        assert!(matches!(err, CliError::AuthKeyEnvironment(_)));
+        assert!(err.to_string().contains("environment variable not found"));
     }
 }

@@ -17,7 +17,8 @@ use crate::scanner::{
     yara::load_yara_rules_cache,
 };
 use crate::updater::{
-    update_signatures::update_signatures_using_malware_bazaar, update_yara_rules::update_yara_rules,
+    update_signatures::{UpdateSignaturesError, update_signatures_using_malware_bazaar},
+    update_yara_rules::{UpdateYaraRulesError, update_yara_rules},
 };
 
 use crate::cli::{Command, OutputFormat, ScanArgs, UpdateArgs, parse_args};
@@ -61,7 +62,7 @@ where
             Err(_) => EXIT_OPERATIONAL_ERROR,
         },
         Err(err) => {
-            let _ = writeln!(stdout, "Error: {:?}", err);
+            let _ = writeln!(stdout, "Error: {:?}", err.to_string());
             EXIT_DETECTIONS
         }
     }
@@ -292,10 +293,10 @@ where
 /// Backend boundary for update side effects so command handling can be unit tested.
 trait UpdateBackend {
     /// Update malware signatures and return the number of processed rows.
-    fn update_signatures(&self, args: &UpdateArgs) -> Result<usize, String>;
+    fn update_signatures(&self, args: &UpdateArgs) -> Result<usize, UpdateSignaturesError>;
 
     /// Update compiled YARA rules and return the number of compiled rules.
-    fn update_yara_rules(&self, args: &UpdateArgs) -> Result<usize, String>;
+    fn update_yara_rules(&self, args: &UpdateArgs) -> Result<usize, UpdateYaraRulesError>;
 }
 
 /// Backend used in production code.
@@ -303,23 +304,23 @@ struct RealUpdateBackend;
 
 #[cfg(not(tarpaulin))]
 impl UpdateBackend for RealUpdateBackend {
-    fn update_signatures(&self, args: &UpdateArgs) -> Result<usize, String> {
+    fn update_signatures(&self, args: &UpdateArgs) -> Result<usize, UpdateSignaturesError> {
         update_signatures_using_malware_bazaar(&args.auth_key, "100", &args.database)
     }
 
-    fn update_yara_rules(&self, args: &UpdateArgs) -> Result<usize, String> {
+    fn update_yara_rules(&self, args: &UpdateArgs) -> Result<usize, UpdateYaraRulesError> {
         update_yara_rules(&args.yara_rules_path, &args.yara_rules_cache)
     }
 }
 
 #[cfg(tarpaulin)]
 impl UpdateBackend for RealUpdateBackend {
-    fn update_signatures(&self, _args: &UpdateArgs) -> Result<usize, String> {
-        Err("network update disabled during coverage".to_string())
+    fn update_signatures(&self, _args: &UpdateArgs) -> Result<usize, UpdateSignaturesError> {
+        Err(UpdateSignaturesError::NetworkUpdateDisabled)
     }
 
-    fn update_yara_rules(&self, _args: &UpdateArgs) -> Result<usize, String> {
-        Err("YARA update disabled during coverage".to_string())
+    fn update_yara_rules(&self, _args: &UpdateArgs) -> Result<usize, UpdateYaraRulesError> {
+        Err(UpdateYaraRulesError::YaraUpdateDisabled)
     }
 }
 
@@ -424,16 +425,16 @@ mod tests {
 
     /// Backend used in testing as a mock.
     struct FakeUpdateBackend {
-        signatures: Result<usize, String>,
-        yara_rules: Result<usize, String>,
+        signatures: Result<usize, UpdateSignaturesError>,
+        yara_rules: Result<usize, UpdateYaraRulesError>,
     }
 
     impl UpdateBackend for FakeUpdateBackend {
-        fn update_signatures(&self, _args: &UpdateArgs) -> Result<usize, String> {
+        fn update_signatures(&self, _args: &UpdateArgs) -> Result<usize, UpdateSignaturesError> {
             self.signatures.clone()
         }
 
-        fn update_yara_rules(&self, _args: &UpdateArgs) -> Result<usize, String> {
+        fn update_yara_rules(&self, _args: &UpdateArgs) -> Result<usize, UpdateYaraRulesError> {
             self.yara_rules.clone()
         }
     }
@@ -1023,7 +1024,9 @@ mod tests {
     #[test]
     fn update_command_stops_when_signature_update_fails() {
         let backend = FakeUpdateBackend {
-            signatures: Err("network unavailable".to_string()),
+            signatures: Err(UpdateSignaturesError::RecentFetch(
+                "network unavailable".to_string(),
+            )),
             yara_rules: Ok(2),
         };
         let mut stdout = Vec::new();
@@ -1044,7 +1047,10 @@ mod tests {
     fn update_command_reports_yara_update_failure() {
         let backend = FakeUpdateBackend {
             signatures: Ok(3),
-            yara_rules: Err("invalid rule".to_string()),
+            yara_rules: Err(UpdateYaraRulesError::RuleCompile {
+                path: PathBuf::from("rules/bad.yar"),
+                error: "invalid rule".to_string(),
+            }),
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1058,6 +1064,22 @@ mod tests {
         assert!(stdout.contains("Failed to update YARA rules"));
         assert!(stderr.contains("Updating malware signatures"));
         assert!(stderr.contains("Updating YARA rules"));
+    }
+
+    #[cfg(tarpaulin)]
+    #[test]
+    fn real_update_backend_reports_disabled_updates_under_coverage() {
+        let backend = RealUpdateBackend;
+        let args = update_args();
+
+        assert_eq!(
+            backend.update_signatures(&args).unwrap_err(),
+            UpdateSignaturesError::NetworkUpdateDisabled
+        );
+        assert_eq!(
+            backend.update_yara_rules(&args).unwrap_err(),
+            UpdateYaraRulesError::YaraUpdateDisabled
+        );
     }
 
     #[test]

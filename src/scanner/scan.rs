@@ -7,6 +7,7 @@ use super::{
     hash::{FileHashes, hash_file_from_disk, hash_file_from_memory},
 };
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{Cursor, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
@@ -14,6 +15,33 @@ const MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE: u64 = 64 * 1024 * 1024;
 const RETAINED_ENTRY_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
 const MAX_ALLOWED_RECURSION: usize = 5;
 const MAX_ALLOWED_ARCHIVE_ENTRIES: usize = 10000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScanError {
+    HashComparisonFailed,
+    YaraScanFailed(String),
+    ArchiveKindProbeFailed(String),
+    ZipOpenFailed(String),
+    GzipDecompressedSizeLimitExceeded,
+    GzipDecompressionFailed(String),
+}
+
+impl fmt::Display for ScanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScanError::HashComparisonFailed => write!(formatter, "Unable to compare hash"),
+            ScanError::YaraScanFailed(err)
+            | ScanError::ArchiveKindProbeFailed(err)
+            | ScanError::ZipOpenFailed(err)
+            | ScanError::GzipDecompressionFailed(err) => write!(formatter, "{err}"),
+            ScanError::GzipDecompressedSizeLimitExceeded => {
+                write!(formatter, "gzip decompressed size limit exceeded")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScanError {}
 
 #[derive(Debug, Default)]
 /// Tracks safety limits that must be shared while scanning one archive tree.
@@ -331,9 +359,9 @@ pub fn scan_path(
 fn scan_file_hashes_from_disk(
     path: impl AsRef<Path>,
     hash_database: &HashDatabase,
-) -> Result<HashScanResult, String> {
+) -> Result<HashScanResult, ScanError> {
     let hashes = match hash_file_from_disk(path) {
-        Err(_) => return Err("Unable to compare hash".to_string()),
+        Err(_) => return Err(ScanError::HashComparisonFailed),
         Ok(hashes) => hashes,
     };
     compare_hashes(hashes, hash_database)
@@ -343,9 +371,9 @@ fn scan_file_hashes_from_disk(
 fn scan_file_hashes_from_memory(
     buffer: &[u8],
     hash_database: &HashDatabase,
-) -> Result<HashScanResult, String> {
+) -> Result<HashScanResult, ScanError> {
     let hashes = match hash_file_from_memory(buffer) {
-        Err(_) => return Err("Unable to compare hash".to_string()),
+        Err(_) => return Err(ScanError::HashComparisonFailed),
         Ok(hashes) => hashes,
     };
     compare_hashes(hashes, hash_database)
@@ -355,7 +383,7 @@ fn scan_file_hashes_from_memory(
 fn compare_hashes(
     hashes: FileHashes,
     hash_database: &HashDatabase,
-) -> Result<HashScanResult, String> {
+) -> Result<HashScanResult, ScanError> {
     if hash_database.contains(&hashes) {
         return Ok(HashScanResult::KnownHash { _family: None });
     };
@@ -366,10 +394,10 @@ fn compare_hashes(
 fn scan_file_yara_from_disk(
     path: &Path,
     scanner: &mut yara_x::Scanner,
-) -> Result<YaraScanResult, String> {
+) -> Result<YaraScanResult, ScanError> {
     let results = match scanner.scan_file(path) {
         Ok(results) => results,
-        Err(err) => return Err(err.to_string()),
+        Err(err) => return Err(ScanError::YaraScanFailed(err.to_string())),
     };
 
     // Guard to catch clean scans without allocating.
@@ -392,10 +420,10 @@ fn scan_file_yara_from_disk(
 fn scan_file_yara_from_memory(
     buffer: &[u8],
     scanner: &mut yara_x::Scanner,
-) -> Result<YaraScanResult, String> {
+) -> Result<YaraScanResult, ScanError> {
     let results = match scanner.scan(buffer) {
         Ok(results) => results,
-        Err(err) => return Err(err.to_string()),
+        Err(err) => return Err(ScanError::YaraScanFailed(err.to_string())),
     };
 
     // Guard to catch clean scans without allocating.
@@ -828,7 +856,7 @@ fn scan_bytes_with_state(
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
     archive_state: &mut ArchiveScanState,
-) -> Result<(), String> {
+) -> Result<(), ScanError> {
     let mut heuristics = HeuristicAccumulator::new();
     let mut surface = DetectionSurface::ArchiveEntry;
     // Skip files with a length of 0.
@@ -870,7 +898,7 @@ fn scan_bytes_with_state(
                     virtual_path.display(),
                     err
                 );
-                return Err(err.to_string());
+                return Err(ScanError::ArchiveKindProbeFailed(err.to_string()));
             }
         };
 
@@ -1003,7 +1031,7 @@ fn scan_zip_archive<R>(
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
     depth: usize,
-) -> Result<(), String>
+) -> Result<(), ScanError>
 where
     R: Read + std::io::Seek,
 {
@@ -1025,7 +1053,7 @@ fn scan_zip_archive_with_state<R>(
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
     archive_state: &mut ArchiveScanState,
-) -> Result<(), String>
+) -> Result<(), ScanError>
 where
     R: Read + std::io::Seek,
 {
@@ -1035,7 +1063,8 @@ where
 
     summary.archives_scanned += 1;
 
-    let mut archive = zip::ZipArchive::new(reader).map_err(|err| err.to_string())?;
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|err| ScanError::ZipOpenFailed(err.to_string()))?;
     let mut entry_buffer = Vec::new();
 
     for i in 0..archive.len() {
@@ -1120,7 +1149,7 @@ fn scan_tar_archive<R>(
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
     depth: usize,
-) -> Result<(), String>
+) -> Result<(), ScanError>
 where
     R: Read,
 {
@@ -1142,7 +1171,7 @@ fn scan_tar_archive_with_state<R>(
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
     archive_state: &mut ArchiveScanState,
-) -> Result<(), String>
+) -> Result<(), ScanError>
 where
     R: Read,
 {
@@ -1260,7 +1289,7 @@ fn scan_gzip_reader<R>(
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
     depth: usize,
-) -> Result<(), String>
+) -> Result<(), ScanError>
 where
     R: Read,
 {
@@ -1282,7 +1311,7 @@ fn scan_gzip_reader_with_state<R>(
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
     archive_state: &mut ArchiveScanState,
-) -> Result<(), String>
+) -> Result<(), ScanError>
 where
     R: Read,
 {
@@ -1294,12 +1323,12 @@ where
 
     let decompressed = match decompress_gzip_limited(reader, MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE) {
         Ok(bytes) => bytes,
-        Err(err) if err.contains("size limit exceeded") => {
+        Err(ScanError::GzipDecompressedSizeLimitExceeded) => {
             summary.record_skip(SkipReason::MaxDecompressedBytes);
             eprintln!(
                 "Skipped gzip archive: decompression limit reached: {} ({})",
                 archive_path.display(),
-                err
+                ScanError::GzipDecompressedSizeLimitExceeded
             );
             return Ok(());
         }
@@ -1340,7 +1369,7 @@ where
 fn decompress_gzip_limited<R: Read>(
     reader: R,
     max_decompressed_size: u64,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, ScanError> {
     let mut decoder = flate2::read::GzDecoder::new(reader);
 
     let mut limited_reader = decoder.by_ref().take(max_decompressed_size + 1);
@@ -1348,10 +1377,10 @@ fn decompress_gzip_limited<R: Read>(
 
     limited_reader
         .read_to_end(&mut decompressed)
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| ScanError::GzipDecompressionFailed(err.to_string()))?;
 
     if decompressed.len() as u64 > max_decompressed_size {
-        return Err("gzip decompressed size limit exceeded".to_string());
+        return Err(ScanError::GzipDecompressedSizeLimitExceeded);
     }
 
     Ok(decompressed)
@@ -1932,7 +1961,8 @@ mod tests {
 
         let err = scan_file_hashes_from_disk(&target, &database).unwrap_err();
 
-        assert_eq!(err, "Unable to compare hash");
+        assert_eq!(err, ScanError::HashComparisonFailed);
+        assert_eq!(err.to_string(), "Unable to compare hash");
     }
 
     #[test]
@@ -2006,7 +2036,8 @@ mod tests {
 
         let err = scan_file_yara_from_disk(&target, &mut scanner).unwrap_err();
 
-        assert!(!err.is_empty());
+        assert!(matches!(err, ScanError::YaraScanFailed(_)));
+        assert!(!err.to_string().is_empty());
     }
 
     #[test]
@@ -2917,7 +2948,8 @@ mod tests {
         let err =
             decompress_gzip_limited(std::io::Cursor::new(gzip_bytes(b"abcdef")), 5).unwrap_err();
 
-        assert_eq!(err, "gzip decompressed size limit exceeded");
+        assert_eq!(err, ScanError::GzipDecompressedSizeLimitExceeded);
+        assert_eq!(err.to_string(), "gzip decompressed size limit exceeded");
     }
 
     #[test]
@@ -3139,7 +3171,8 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("invalid Zip archive"));
+        assert!(matches!(err, ScanError::ZipOpenFailed(_)));
+        assert!(err.to_string().contains("invalid Zip archive"));
         assert_eq!(summary.archives_scanned, 1);
     }
 

@@ -424,8 +424,8 @@ Current testing includes:
 Current measured coverage is approximately:
 
 ```text
-Code coverage: 85.1%
-Mutation score: 80.5%
+Code coverage: 81.9%
+Mutation score: 80.9%
 ```
 
 Fuzzing is being added for parser, archive, and hostile-input paths. Surviving mutants are also being reviewed and documented where they expose meaningful gaps or deliberate equivalences.
