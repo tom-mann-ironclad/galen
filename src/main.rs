@@ -428,7 +428,7 @@ fn help_text() -> &'static str {
     "\
 Usage:
   galen scan <target> [--database <path>] [--yara-cache <path>] [--output <format>]
-  galen update
+  galen update [--database <path>] [--yara-dir <path>] [--yara-cache <path>]
   galen --help
 
 Commands:
@@ -437,7 +437,8 @@ Commands:
 
 Options:
   -d, --database <path>   Path to signature database
-  -y, --yara-cache <path> Path to YARA rules directory
+      --yara-dir <path>   Path to source YARA rules directory
+  -y, --yara-cache <path> Path to compiled YARA rules cache
   -o, --output            The output format for scan results: human (default) or json  
   -h, --help              Show this help text
 "
@@ -591,7 +592,7 @@ mod tests {
             "\
 Usage:
   galen scan <target> [--database <path>] [--yara-cache <path>] [--output <format>]
-  galen update
+  galen update [--database <path>] [--yara-dir <path>] [--yara-cache <path>]
   galen --help
 
 Commands:
@@ -600,7 +601,8 @@ Commands:
 
 Options:
   -d, --database <path>   Path to signature database
-  -y, --yara-cache <path> Path to YARA rules directory
+      --yara-dir <path>   Path to source YARA rules directory
+  -y, --yara-cache <path> Path to compiled YARA rules cache
   -o, --output            The output format for scan results: human (default) or json  
   -h, --help              Show this help text
 "

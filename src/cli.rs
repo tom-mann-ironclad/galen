@@ -171,25 +171,48 @@ fn parse_update<I>(args: I) -> Result<Command, CliError>
 where
     I: IntoIterator<Item = String>,
 {
+    let mut database = PathBuf::from(DEFAULT_DATABASE);
+    let mut yara_rules_path = PathBuf::from(DEFAULT_YARA_DIR);
+    let mut yara_rules_cache = PathBuf::from(DEFAULT_YARA_CACHE);
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--database" | "-d" => {
+                let Some(value) = args.next() else {
+                    return Err(CliError::NoArgumentsProvided);
+                };
+
+                database = PathBuf::from(value);
+            }
+            "--yara-dir" => {
+                let Some(value) = args.next() else {
+                    return Err(CliError::NoArgumentsProvided);
+                };
+
+                yara_rules_path = PathBuf::from(value);
+            }
+            "--yara-cache" | "-y" => {
+                let Some(value) = args.next() else {
+                    return Err(CliError::NoArgumentsProvided);
+                };
+
+                yara_rules_cache = PathBuf::from(value);
+            }
+            _other => return Err(CliError::UnknownParameterProvided),
+        }
+    }
+
     let auth_key = match std::env::var("GALEN_AUTH_KEY") {
         Ok(key) => key,
         Err(err) => return Err(CliError::AuthKeyEnvironment(err)),
     };
-    let mut args = args.into_iter();
-
-    if let Some(arg) = args.next() {
-        // Guard to catch invalid parameters
-        let _value = arg.as_str();
-        {
-            return Err(CliError::UnknownParameterProvided);
-        }
-    }
 
     Ok(Command::Update(UpdateArgs {
-        database: PathBuf::from(DEFAULT_DATABASE),
+        database,
         auth_key,
-        yara_rules_path: PathBuf::from(DEFAULT_YARA_DIR),
-        yara_rules_cache: PathBuf::from(DEFAULT_YARA_CACHE),
+        yara_rules_path,
+        yara_rules_cache,
     }))
 }
 
@@ -407,11 +430,92 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_accepts_custom_paths() {
+        let _guard = GalenAuthKeyGuard::set("test-auth-key");
+
+        let command = parse_args(args(&[
+            "galen",
+            "update",
+            "--database",
+            "custom.sqlite",
+            "--yara-dir",
+            "custom-rules",
+            "--yara-cache",
+            "custom-cache.yaraxc",
+        ]))
+        .unwrap();
+
+        let Command::Update(update) = command else {
+            panic!("expected update command");
+        };
+
+        assert_eq!(update.auth_key, "test-auth-key");
+        assert_eq!(update.database, PathBuf::from("custom.sqlite"));
+        assert_eq!(update.yara_rules_path, PathBuf::from("custom-rules"));
+        assert_eq!(update.yara_rules_cache, PathBuf::from("custom-cache.yaraxc"));
+    }
+
+    #[test]
+    fn parse_update_accepts_partial_custom_paths_and_keeps_defaults() {
+        let _guard = GalenAuthKeyGuard::set("test-auth-key");
+
+        let command = parse_args(args(&[
+            "galen",
+            "update",
+            "-d",
+            "custom.sqlite",
+            "-y",
+            "custom-cache.yaraxc",
+        ]))
+        .unwrap();
+
+        let Command::Update(update) = command else {
+            panic!("expected update command");
+        };
+
+        assert_eq!(update.database, PathBuf::from("custom.sqlite"));
+        assert_eq!(update.yara_rules_path, PathBuf::from(DEFAULT_YARA_DIR));
+        assert_eq!(update.yara_rules_cache, PathBuf::from("custom-cache.yaraxc"));
+    }
+
+    #[test]
     fn parse_update_rejects_unexpected_arguments() {
         let _guard = GalenAuthKeyGuard::set("test-auth-key");
 
         assert_eq!(
-            parse_error(&["galen", "update", "--database", "custom.sqlite"]),
+            parse_error(&["galen", "update", "--unknown", "custom.sqlite"]),
+            CliError::UnknownParameterProvided
+        );
+        assert_eq!(
+            parse_error(&["galen", "update", "custom.sqlite"]),
+            CliError::UnknownParameterProvided
+        );
+    }
+
+    #[test]
+    fn parse_update_rejects_missing_parameter_values() {
+        let _guard = GalenAuthKeyGuard::set("test-auth-key");
+
+        assert_eq!(
+            parse_error(&["galen", "update", "--database"]),
+            CliError::NoArgumentsProvided
+        );
+        assert_eq!(
+            parse_error(&["galen", "update", "--yara-dir"]),
+            CliError::NoArgumentsProvided
+        );
+        assert_eq!(
+            parse_error(&["galen", "update", "--yara-cache"]),
+            CliError::NoArgumentsProvided
+        );
+    }
+
+    #[test]
+    fn parse_update_rejects_unknown_parameters_before_requiring_auth_key() {
+        let _guard = GalenAuthKeyGuard::unset();
+
+        assert_eq!(
+            parse_error(&["galen", "update", "--unknown"]),
             CliError::UnknownParameterProvided
         );
     }
