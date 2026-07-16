@@ -413,6 +413,7 @@ Current testing includes:
 * A generated scan corpus
 * Nested-archive tests
 * Archive-limit tests
+* Malicious archive tests
 * Path-handling tests
 * Detection-report tests
 * Mutation testing
@@ -424,8 +425,8 @@ Current testing includes:
 Current measured coverage is approximately:
 
 ```text
-Code coverage: 81.9%
-Mutation score: 80.9%
+Code coverage: 81.1%
+Mutation score: 81.1%
 ```
 
 Fuzzing is being added for parser, archive, and hostile-input paths. Surviving mutants are also being reviewed and documented where they expose meaningful gaps or deliberate equivalences.

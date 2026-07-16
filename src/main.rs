@@ -160,15 +160,26 @@ where
     if !summary.yara_rules_triggered.is_empty() {
         writeln!(
             output,
-            "{} YARA rules triggered:",
-            summary.yara_rules_triggered.len()
+            "{} {} triggered:",
+            summary.yara_rules_triggered.len(),
+            pluralise(
+                summary.yara_rules_triggered.len() as u64,
+                "YARA rule",
+                "YARA rules"
+            )
         )?;
 
         let mut rules: Vec<_> = summary.yara_rules_triggered.iter().collect();
         rules.sort_by_key(|(rule, _count)| rule.as_str());
 
         for (rule, count) in rules {
-            writeln!(output, "  {}: {} files", rule, count)?;
+            writeln!(
+                output,
+                "  {}: {} {}",
+                rule,
+                count,
+                pluralise(*count as u64, "file", "files")
+            )?;
         }
     }
 
@@ -186,20 +197,45 @@ where
     }
 
     writeln!(output, "----------- SCAN SUMMARY -----------")?;
-    writeln!(output, "Scanned {} files", summary.total_files_scanned())?;
     writeln!(
         output,
-        "  filesystem files: {}",
+        "Scanned {} {}",
+        summary.total_files_scanned(),
+        pluralise(summary.total_files_scanned(), "file", "files")
+    )?;
+    writeln!(
+        output,
+        "  {}: {}",
+        pluralise(
+            summary.filesystem_files_scanned,
+            "filesystem file",
+            "filesystem files"
+        ),
         summary.filesystem_files_scanned
     )?;
     writeln!(
         output,
-        "  archive entries: {}",
+        "  {}: {}",
+        pluralise(
+            summary.archive_entries_scanned,
+            "archive entry",
+            "archive entries"
+        ),
         summary.archive_entries_scanned
     )?;
-    writeln!(output, "Scanned archives: {}", summary.archives_scanned)?;
+    writeln!(
+        output,
+        "Scanned {}: {}",
+        pluralise(summary.archives_scanned, "archive", "archives"),
+        summary.archives_scanned
+    )?;
     if summary.files_skipped > 0 {
-        writeln!(output, "Skipped {} files", summary.files_skipped)?;
+        writeln!(
+            output,
+            "Skipped {} {}",
+            summary.files_skipped,
+            pluralise(summary.files_skipped, "file", "files")
+        )?;
 
         for reason in SkipReason::ALL {
             let count = summary.skip_count(reason);
@@ -221,20 +257,33 @@ where
 
     writeln!(
         output,
-        "Detection records: {}",
+        "{}: {}",
+        pluralise(
+            visible_detection_records.len() as u64,
+            "Detection record",
+            "Detection records"
+        ),
         visible_detection_records.len()
     )?;
     if !summary.detections.is_empty() {
         writeln!(
             output,
             "  {}: {}",
-            DetectionSurface::FileSystemFile.label(),
+            pluralise(
+                filesystem_path_detections as u64,
+                DetectionSurface::FileSystemFile.label(),
+                "filesystem files"
+            ),
             filesystem_path_detections
         )?;
         writeln!(
             output,
             "  {}: {}",
-            DetectionSurface::ArchiveEntry.label(),
+            pluralise(
+                archive_path_detections as u64,
+                DetectionSurface::ArchiveEntry.label(),
+                "archive entries"
+            ),
             archive_path_detections
         )?;
     }
@@ -245,6 +294,11 @@ where
     } else {
         Ok(EXIT_DETECTIONS)
     }
+}
+
+/// Helper function to pluralise any strings.
+fn pluralise<'a>(count: u64, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
 }
 
 /// Select human-visible detections while suppressing child archive containers.
@@ -498,6 +552,25 @@ mod tests {
         }
     }
 
+    fn assert_output_line(output: &str, expected: &str) {
+        assert!(
+            output.lines().any(|line| line == expected),
+            "expected output line {expected:?}\noutput:\n{output}"
+        );
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("forced write failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn help_text_contains_usage_commands_and_options() {
         let help = help_text();
@@ -509,6 +582,29 @@ mod tests {
         assert!(help.contains("--yara-cache"));
         assert!(help.contains("--output"));
         assert!(!help.trim().is_empty());
+    }
+
+    #[test]
+    fn help_text_matches_expected_output() {
+        assert_eq!(
+            help_text(),
+            "\
+Usage:
+  galen scan <target> [--database <path>] [--yara-cache <path>] [--output <format>]
+  galen update
+  galen --help
+
+Commands:
+  scan      Scan a file or directory
+  update    Update local signatures
+
+Options:
+  -d, --database <path>   Path to signature database
+  -y, --yara-cache <path> Path to YARA rules directory
+  -o, --output            The output format for scan results: human (default) or json  
+  -h, --help              Show this help text
+"
+        );
     }
 
     #[test]
@@ -524,6 +620,43 @@ mod tests {
             String::from_utf8(stderr)
                 .unwrap()
                 .contains(env!("CARGO_PKG_NAME"))
+        );
+    }
+
+    #[test]
+    fn run_cli_help_command_writes_exact_help_and_success_exit() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = run_cli(args(&["galen", "help"]), &mut stdout, &mut stderr);
+
+        assert_eq!(exit_code, EXIT_SUCCESS);
+        assert_eq!(String::from_utf8(stdout).unwrap(), help_text());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!(
+                "{} v{}\n",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    #[test]
+    fn run_cli_help_returns_operational_error_when_help_text_cannot_be_written() {
+        let mut stdout = FailingWriter;
+        let mut stderr = Vec::new();
+
+        let exit_code = run_cli(args(&["galen", "--help"]), &mut stdout, &mut stderr);
+
+        assert_eq!(exit_code, EXIT_OPERATIONAL_ERROR);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!(
+                "{} v{}\n",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            )
         );
     }
 
@@ -559,7 +692,7 @@ mod tests {
 
         assert_eq!(exit_code, EXIT_SUCCESS);
         assert!(output.contains("Detections:"));
-        assert!(output.contains("Scanned 1 files"));
+        assert!(output.contains("Scanned 1 file"));
         assert!(output.contains("Scan time: 25ms"));
     }
 
@@ -580,7 +713,7 @@ mod tests {
 
         assert_eq!(exit_code, EXIT_DETECTIONS);
         assert!(output.contains("[malicious] payload.bin"));
-        assert!(output.contains("Detection records: 1"));
+        assert!(output.contains("Detection record: 1"));
     }
 
     #[test]
@@ -615,6 +748,86 @@ mod tests {
         assert!(output.contains("Detection records: 2"));
         assert!(output.contains("filesystem file: 1"));
         assert!(output.contains("archive entry: 1"));
+    }
+
+    #[test]
+    fn human_scan_report_uses_singular_count_labels() {
+        let mut summary = ScanSummaryStats::new();
+        summary.filesystem_files_scanned = 1;
+        summary.archives_scanned = 1;
+        summary.record_skip(SkipReason::ZeroSize);
+        summary
+            .yara_rules_triggered
+            .insert("one_rule".to_string(), 1);
+        summary.detections = vec![detection(
+            "payload.bin",
+            DetectionSurface::FileSystemFile,
+            Verdict::Malicious,
+        )];
+        let mut output = Vec::new();
+
+        let exit_code =
+            write_human_scan_report(&summary, Duration::from_millis(1), &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert_eq!(exit_code, EXIT_DETECTIONS);
+        assert_output_line(&output, "1 YARA rule triggered:");
+        assert_output_line(&output, "  one_rule: 1 file");
+        assert_output_line(&output, "Scanned 1 file");
+        assert_output_line(&output, "  filesystem file: 1");
+        assert_output_line(&output, "Scanned archive: 1");
+        assert_output_line(&output, "Skipped 1 file");
+        assert_output_line(&output, "Detection record: 1");
+    }
+
+    #[test]
+    fn human_scan_report_uses_plural_count_labels() {
+        let mut summary = ScanSummaryStats::new();
+        summary.filesystem_files_scanned = 2;
+        summary.archive_entries_scanned = 2;
+        summary.archives_scanned = 2;
+        summary.record_skip(SkipReason::ZeroSize);
+        summary.record_skip(SkipReason::PermissionDenied);
+        summary.yara_rules_triggered.insert("a_rule".to_string(), 2);
+        summary.yara_rules_triggered.insert("b_rule".to_string(), 2);
+        summary.detections = vec![
+            detection(
+                "one.bin",
+                DetectionSurface::FileSystemFile,
+                Verdict::Malicious,
+            ),
+            detection(
+                "two.bin",
+                DetectionSurface::FileSystemFile,
+                Verdict::Malicious,
+            ),
+            detection(
+                "archive.zip!/one.bin",
+                DetectionSurface::ArchiveEntry,
+                Verdict::Malicious,
+            ),
+            detection(
+                "archive.zip!/two.bin",
+                DetectionSurface::ArchiveEntry,
+                Verdict::Malicious,
+            ),
+        ];
+        let mut output = Vec::new();
+
+        let exit_code =
+            write_human_scan_report(&summary, Duration::from_millis(1), &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert_eq!(exit_code, EXIT_DETECTIONS);
+        assert_output_line(&output, "2 YARA rules triggered:");
+        assert_output_line(&output, "  a_rule: 2 files");
+        assert_output_line(&output, "  b_rule: 2 files");
+        assert_output_line(&output, "Scanned 4 files");
+        assert_output_line(&output, "  filesystem files: 2");
+        assert_output_line(&output, "  archive entries: 2");
+        assert_output_line(&output, "Scanned archives: 2");
+        assert_output_line(&output, "Skipped 2 files");
+        assert_output_line(&output, "Detection records: 4");
     }
 
     #[test]
@@ -658,7 +871,7 @@ mod tests {
         assert_eq!(exit_code, EXIT_DETECTIONS);
         assert!(!output.contains("[malicious] archive.zip\n"));
         assert!(output.contains("[malicious] archive.zip!/payload.bin"));
-        assert!(output.contains("Detection records: 1"));
+        assert!(output.contains("Detection record: 1"));
         assert!(output.contains("archive entry: 1"));
     }
 
@@ -885,7 +1098,7 @@ mod tests {
         let stderr = String::from_utf8(stderr).unwrap();
 
         assert_eq!(exit_code, EXIT_SUCCESS);
-        assert!(stdout.contains("Scanned 1 files"));
+        assert!(stdout.contains("Scanned 1 file"));
         assert!(stdout.contains("Detection records: 0"));
         assert!(stderr.contains("Loading"));
         assert!(stderr.contains("Starting scan"));
