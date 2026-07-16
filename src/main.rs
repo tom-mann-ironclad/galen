@@ -63,7 +63,7 @@ where
         },
         Err(err) => {
             let _ = writeln!(stdout, "Error: {:?}", err.to_string());
-            EXIT_DETECTIONS
+            EXIT_OPERATIONAL_ERROR
         }
     }
 }
@@ -534,7 +534,7 @@ mod tests {
 
         let exit_code = run_cli(args(&["galen"]), &mut stdout, &mut stderr);
 
-        assert_eq!(exit_code, EXIT_DETECTIONS);
+        assert_eq!(exit_code, EXIT_OPERATIONAL_ERROR);
         assert!(
             String::from_utf8(stdout)
                 .unwrap()

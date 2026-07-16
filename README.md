@@ -556,12 +556,8 @@ Current priorities include:
 
 * Complete initial fuzzing coverage
 * Document surviving mutants
-* Introduce consistent custom error types
-* Make invalid arguments and unsafe configurations fail closed
 * Add configurable scan and archive limits
 * Improve operator documentation
-* Expand regression and integration coverage
-* Continue false-positive testing
 * Improve detection-confidence calibration
 * Stabilise package and release workflows
 
