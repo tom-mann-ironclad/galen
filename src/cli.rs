@@ -452,7 +452,10 @@ mod tests {
         assert_eq!(update.auth_key, "test-auth-key");
         assert_eq!(update.database, PathBuf::from("custom.sqlite"));
         assert_eq!(update.yara_rules_path, PathBuf::from("custom-rules"));
-        assert_eq!(update.yara_rules_cache, PathBuf::from("custom-cache.yaraxc"));
+        assert_eq!(
+            update.yara_rules_cache,
+            PathBuf::from("custom-cache.yaraxc")
+        );
     }
 
     #[test]
@@ -475,7 +478,10 @@ mod tests {
 
         assert_eq!(update.database, PathBuf::from("custom.sqlite"));
         assert_eq!(update.yara_rules_path, PathBuf::from(DEFAULT_YARA_DIR));
-        assert_eq!(update.yara_rules_cache, PathBuf::from("custom-cache.yaraxc"));
+        assert_eq!(
+            update.yara_rules_cache,
+            PathBuf::from("custom-cache.yaraxc")
+        );
     }
 
     #[test]
