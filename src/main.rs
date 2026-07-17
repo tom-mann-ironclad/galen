@@ -178,7 +178,7 @@ where
                 "  {}: {} {}",
                 rule,
                 count,
-                pluralise(*count as u64, "file", "files")
+                pluralise(*count, "file", "files")
             )?;
         }
     }
