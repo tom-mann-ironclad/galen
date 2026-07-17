@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/tom-mann-ironclad/galen/actions/workflows/ci.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/ci.yaml)
 [![Nightly Packages](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml)
-[![Code Coverage](https://img.shields.io/badge/coverage-81.1%25-brightgreen)](#testing-and-build-assurance)
+[![Code Coverage](https://img.shields.io/badge/coverage-81.2%25-brightgreen)](#testing-and-build-assurance)
 [![Mutation Score](https://img.shields.io/badge/mutation_score-81.1%25-brightgreen)](#testing-and-build-assurance)
 ![GitHub License](https://img.shields.io/github/license/tom-mann-ironclad/galen)
 

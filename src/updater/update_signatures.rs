@@ -1,5 +1,5 @@
 use rusqlite::{Connection, params};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 #[cfg(not(tarpaulin))]
 use std::io::{BufReader, Seek, SeekFrom, copy};
 use std::{fmt, io::BufRead, path::Path};
@@ -25,8 +25,30 @@ const CREATE_MALWARE_HASH_TABLE: &str = r#"
 
 #[derive(Debug, Clone, Deserialize)]
 struct MalwareBazaarResponse {
-    query_status: String, // TODO: Make this typed?
+    query_status: MalwareBazaarQueryStatus,
     data: Option<Vec<MalwareBazaarSample>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MalwareBazaarQueryStatus {
+    Ok,
+    NoResults,
+    Other(String),
+}
+
+impl<'de> Deserialize<'de> for MalwareBazaarQueryStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let status = String::deserialize(deserializer)?;
+
+        Ok(match status.as_str() {
+            "ok" => Self::Ok,
+            "no_results" => Self::NoResults,
+            _other => Self::Other(status),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -184,10 +206,12 @@ fn fetch_malware_bazaar_recent_hashes(
 
     let response: MalwareBazaarResponse = response.body_mut().read_json()?;
 
-    match response.query_status.as_str() {
-        "ok" => Ok(response.data.unwrap_or_default()),
-        "no_results" => Ok(Vec::new()),
-        other => Err(format!("Malware Bazaar query failed: {}", other).into()),
+    match response.query_status {
+        MalwareBazaarQueryStatus::Ok => Ok(response.data.unwrap_or_default()),
+        MalwareBazaarQueryStatus::NoResults => Ok(Vec::new()),
+        MalwareBazaarQueryStatus::Other(status) => {
+            Err(format!("Malware Bazaar query failed: {}", status).into())
+        }
     }
 }
 
@@ -417,6 +441,28 @@ mod tests {
             first_seen: Some("1970-01-01 00:00:01".to_string()),
             file_type: file_type.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn malware_bazaar_query_status_deserializes_known_values() {
+        let ok: MalwareBazaarResponse =
+            serde_json::from_str(r#"{"query_status":"ok","data":[]}"#).unwrap();
+        let no_results: MalwareBazaarResponse =
+            serde_json::from_str(r#"{"query_status":"no_results"}"#).unwrap();
+
+        assert_eq!(ok.query_status, MalwareBazaarQueryStatus::Ok);
+        assert_eq!(no_results.query_status, MalwareBazaarQueryStatus::NoResults);
+    }
+
+    #[test]
+    fn malware_bazaar_query_status_preserves_unknown_values() {
+        let response: MalwareBazaarResponse =
+            serde_json::from_str(r#"{"query_status":"illegal_auth_key"}"#).unwrap();
+
+        assert_eq!(
+            response.query_status,
+            MalwareBazaarQueryStatus::Other("illegal_auth_key".to_string())
+        );
     }
 
     #[test]
