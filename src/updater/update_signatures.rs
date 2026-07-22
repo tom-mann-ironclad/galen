@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Deserializer};
 #[cfg(not(tarpaulin))]
 use std::io::{BufReader, Seek, SeekFrom, copy};
@@ -243,7 +243,10 @@ pub fn update_signatures_using_malware_bazaar(
 
 /// Function to ensure that all required database tables exist.
 fn create_database_tables(path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = Connection::open(path)?;
+    let mut connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )?;
     connection.execute(CREATE_METADATA_TABLE, [])?;
 
     let has_last_request = {
@@ -298,13 +301,18 @@ fn create_database_tables(path: impl AsRef<Path>) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// Open the updater database without implicitly recreating a missing file.
+fn open_existing_database(path: impl AsRef<Path>) -> Result<Connection, rusqlite::Error> {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+}
+
 /// Atomically enforce the request interval and record an allowed outbound call.
 fn claim_malware_bazaar_request(
     path: impl AsRef<Path>,
     mode: &str,
     now: i64,
 ) -> Result<RequestClaim, Box<dyn std::error::Error>> {
-    let mut connection = Connection::open(path)?;
+    let mut connection = open_existing_database(path)?;
     let tx = connection.transaction()?;
     let cutoff = now.saturating_sub(MALWARE_BAZAAR_REQUEST_INTERVAL_SECONDS);
     let changed = tx.execute(
@@ -350,7 +358,7 @@ fn record_successful_malware_bazaar_update(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rows_seen = i64::try_from(counts.rows_seen)?;
     let rows_inserted = i64::try_from(counts.rows_inserted)?;
-    let connection = Connection::open(path)?;
+    let connection = open_existing_database(path)?;
     let changed = connection.execute(
         r#"
         UPDATE update_metadata
@@ -424,7 +432,7 @@ fn insert_malware_bazaar_hashes(
     db_path: impl AsRef<Path>,
     samples: &[MalwareBazaarSample],
 ) -> Result<UpdateCounts, Box<dyn std::error::Error>> {
-    let mut connection = Connection::open(db_path)?;
+    let mut connection = open_existing_database(db_path)?;
     let tx = connection.transaction()?;
 
     let mut inserted = 0;
@@ -481,7 +489,7 @@ fn insert_hash_lines<R: BufRead>(
     db_path: impl AsRef<Path>,
     reader: R,
 ) -> Result<UpdateCounts, Box<dyn std::error::Error>> {
-    let mut connection = Connection::open(db_path)?;
+    let mut connection = open_existing_database(db_path)?;
     let tx = connection.transaction()?;
 
     let mut inserted = 0;
@@ -568,7 +576,7 @@ fn parse_malware_bazaar_timestamp(value: Option<&str>) -> Option<i64> {
 
 /// Function to get the number of malware hashes in the database.
 fn malware_hash_count(path: impl AsRef<Path>) -> Result<i64, rusqlite::Error> {
-    let connection = Connection::open(path)?;
+    let connection = open_existing_database(path)?;
     let count: i64 =
         connection.query_row("SELECT COUNT(*) FROM malware_hashes", [], |row| row.get(0))?;
     Ok(count)
@@ -729,6 +737,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(not_null, 1);
+    }
+
+    #[test]
+    fn open_existing_database_does_not_recreate_a_missing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.sqlite");
+
+        let err = open_existing_database(&path).unwrap_err();
+
+        assert!(!path.exists());
+        assert!(err.to_string().contains("open"));
     }
 
     #[test]

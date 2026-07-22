@@ -1,5 +1,5 @@
 use super::hash::FileHashes;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
 const SHA256_QUERY: &str = "SELECT sha256 FROM malware_hashes ORDER BY sha256";
@@ -28,7 +28,7 @@ impl HashDatabase {
 
 /// Function to load a hash database from an SQLite database on disk.
 pub fn load_hash_database(path: impl AsRef<Path>) -> Result<HashDatabase, rusqlite::Error> {
-    let connection = Connection::open(path)?;
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 
     let mut database = HashDatabase::default();
 
@@ -117,5 +117,16 @@ mod tests {
         let err = load_hash_database(file.path()).unwrap_err();
 
         assert!(err.to_string().contains("malware_hashes"));
+    }
+
+    #[test]
+    fn load_hash_database_does_not_create_a_missing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.sqlite");
+
+        let err = load_hash_database(&path).unwrap_err();
+
+        assert!(!path.exists());
+        assert!(err.to_string().contains("open"));
     }
 }
