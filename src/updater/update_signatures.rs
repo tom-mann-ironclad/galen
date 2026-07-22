@@ -7,6 +7,7 @@ use std::{fmt, io::BufRead, path::Path};
 const CREATE_METADATA_TABLE: &str = r#"
         CREATE TABLE IF NOT EXISTS update_metadata (
             source TEXT PRIMARY KEY NOT NULL,
+            last_request INTEGER NOT NULL,
             last_successful_update INTEGER,
             last_mode TEXT NOT NULL,
             rows_seen INTEGER NOT NULL,
@@ -22,6 +23,10 @@ const CREATE_MALWARE_HASH_TABLE: &str = r#"
             file_type TEXT,
             imported_at INTEGER NOT NULL
     );"#;
+
+// Use a conservative fair-use interval aligned with Malware Bazaar's documented one-hour window
+// for recent data.
+const MALWARE_BAZAAR_REQUEST_INTERVAL_SECONDS: i64 = 60 * 60;
 
 #[derive(Debug, Clone, Deserialize)]
 struct MalwareBazaarResponse {
@@ -59,10 +64,31 @@ struct MalwareBazaarSample {
     file_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UpdateCounts {
+    rows_seen: usize,
+    rows_inserted: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestClaim {
+    Allowed,
+    RateLimited { retry_at: i64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateSignaturesOutcome {
+    /// The request completed and this many database rows were processed.
+    Updated(usize),
+    /// The request was skipped until the supplied Unix timestamp.
+    RateLimited { retry_at: i64 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateSignaturesError {
     DatabaseSetup(String),
     DatabaseCount(String),
+    DatabaseMetadata(String),
     FullFetch(String),
     RecentFetch(String),
     DatabaseInsert(String),
@@ -74,6 +100,7 @@ impl fmt::Display for UpdateSignaturesError {
         match self {
             UpdateSignaturesError::DatabaseSetup(err)
             | UpdateSignaturesError::DatabaseCount(err)
+            | UpdateSignaturesError::DatabaseMetadata(err)
             | UpdateSignaturesError::FullFetch(err)
             | UpdateSignaturesError::RecentFetch(err)
             | UpdateSignaturesError::DatabaseInsert(err) => write!(formatter, "{err}"),
@@ -92,7 +119,7 @@ pub fn update_signatures_using_malware_bazaar(
     auth_key: &str,
     selector: &str,
     db_path: impl AsRef<Path>,
-) -> Result<usize, UpdateSignaturesError> {
+) -> Result<UpdateSignaturesOutcome, UpdateSignaturesError> {
     update_signatures_with_client(
         auth_key,
         selector,
@@ -112,7 +139,7 @@ trait MalwareBazaarClient {
         &self,
         auth_key: &str,
         db_path: &Path,
-    ) -> Result<usize, Box<dyn std::error::Error>>;
+    ) -> Result<UpdateCounts, Box<dyn std::error::Error>>;
 }
 
 #[cfg(not(tarpaulin))]
@@ -132,7 +159,7 @@ impl MalwareBazaarClient for LiveMalwareBazaarClient {
         &self,
         auth_key: &str,
         db_path: &Path,
-    ) -> Result<usize, Box<dyn std::error::Error>> {
+    ) -> Result<UpdateCounts, Box<dyn std::error::Error>> {
         fetch_malware_bazaar_full_hashes(auth_key, db_path)
     }
 }
@@ -142,7 +169,7 @@ fn update_signatures_with_client(
     selector: &str,
     db_path: &Path,
     client: &impl MalwareBazaarClient,
-) -> Result<usize, UpdateSignaturesError> {
+) -> Result<UpdateSignaturesOutcome, UpdateSignaturesError> {
     create_database_tables(db_path)
         .map_err(|err| UpdateSignaturesError::DatabaseSetup(err.to_string()))?;
     let existing_entries = match malware_hash_count(db_path) {
@@ -153,12 +180,28 @@ fn update_signatures_with_client(
     // If we have no malware signatures we need to bootstrap the database.
     if existing_entries == 0 {
         eprintln!("Empty database found, bootstrapping...");
+        if let RequestClaim::RateLimited { retry_at } =
+            claim_malware_bazaar_request(db_path, "full", chrono::Utc::now().timestamp())
+                .map_err(|err| UpdateSignaturesError::DatabaseMetadata(err.to_string()))?
+        {
+            return Ok(UpdateSignaturesOutcome::RateLimited { retry_at });
+        }
         match client.fetch_full(auth_key, db_path) {
-            Ok(count) => return Ok(count),
+            Ok(counts) => {
+                record_successful_malware_bazaar_update(db_path, "full", counts)
+                    .map_err(|err| UpdateSignaturesError::DatabaseMetadata(err.to_string()))?;
+                return Ok(UpdateSignaturesOutcome::Updated(counts.rows_inserted));
+            }
             Err(err) => return Err(UpdateSignaturesError::FullFetch(err.to_string())),
         }
     }
 
+    if let RequestClaim::RateLimited { retry_at } =
+        claim_malware_bazaar_request(db_path, "recent", chrono::Utc::now().timestamp())
+            .map_err(|err| UpdateSignaturesError::DatabaseMetadata(err.to_string()))?
+    {
+        return Ok(UpdateSignaturesOutcome::RateLimited { retry_at });
+    }
     let samples = match client.fetch_recent(auth_key, selector) {
         Ok(samples) => samples,
         Err(err) => return Err(UpdateSignaturesError::RecentFetch(err.to_string())),
@@ -167,12 +210,26 @@ fn update_signatures_with_client(
     if !samples.is_empty() {
         eprintln!("Updating database with latest signatures...");
         match insert_malware_bazaar_hashes(db_path, &samples) {
-            Ok(inserted) => return Ok(inserted),
+            Ok(counts) => {
+                record_successful_malware_bazaar_update(db_path, "recent", counts)
+                    .map_err(|err| UpdateSignaturesError::DatabaseMetadata(err.to_string()))?;
+                return Ok(UpdateSignaturesOutcome::Updated(counts.rows_inserted));
+            }
             Err(err) => return Err(UpdateSignaturesError::DatabaseInsert(err.to_string())),
         }
     }
 
-    Ok(0)
+    record_successful_malware_bazaar_update(
+        db_path,
+        "recent",
+        UpdateCounts {
+            rows_seen: 0,
+            rows_inserted: 0,
+        },
+    )
+    .map_err(|err| UpdateSignaturesError::DatabaseMetadata(err.to_string()))?;
+
+    Ok(UpdateSignaturesOutcome::Updated(0))
 }
 
 #[cfg(tarpaulin)]
@@ -180,15 +237,136 @@ pub fn update_signatures_using_malware_bazaar(
     _auth_key: &str,
     _selector: &str,
     _db_path: impl AsRef<Path>,
-) -> Result<usize, UpdateSignaturesError> {
+) -> Result<UpdateSignaturesOutcome, UpdateSignaturesError> {
     Err(UpdateSignaturesError::NetworkUpdateDisabled)
 }
 
 /// Function to ensure that all required database tables exist.
 fn create_database_tables(path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
-    let connection = Connection::open(path)?;
+    let mut connection = Connection::open(path)?;
     connection.execute(CREATE_METADATA_TABLE, [])?;
+
+    let has_last_request = {
+        let mut statement = connection.prepare("PRAGMA table_info(update_metadata)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+
+        for column in columns {
+            if column? == "last_request" {
+                found = true;
+                break;
+            }
+        }
+
+        found
+    };
+
+    if !has_last_request {
+        let tx = connection.transaction()?;
+        tx.execute(
+            "ALTER TABLE update_metadata RENAME TO update_metadata_legacy",
+            [],
+        )?;
+        tx.execute(CREATE_METADATA_TABLE, [])?;
+        tx.execute(
+            r#"
+            INSERT INTO update_metadata (
+                source,
+                last_request,
+                last_successful_update,
+                last_mode,
+                rows_seen,
+                rows_inserted
+            )
+            SELECT
+                source,
+                last_successful_update,
+                last_successful_update,
+                last_mode,
+                rows_seen,
+                rows_inserted
+            FROM update_metadata_legacy
+            WHERE last_successful_update IS NOT NULL
+            "#,
+            [],
+        )?;
+        tx.execute("DROP TABLE update_metadata_legacy", [])?;
+        tx.commit()?;
+    }
+
     connection.execute(CREATE_MALWARE_HASH_TABLE, [])?;
+    Ok(())
+}
+
+/// Atomically enforce the request interval and record an allowed outbound call.
+fn claim_malware_bazaar_request(
+    path: impl AsRef<Path>,
+    mode: &str,
+    now: i64,
+) -> Result<RequestClaim, Box<dyn std::error::Error>> {
+    let mut connection = Connection::open(path)?;
+    let tx = connection.transaction()?;
+    let cutoff = now.saturating_sub(MALWARE_BAZAAR_REQUEST_INTERVAL_SECONDS);
+    let changed = tx.execute(
+        r#"
+        INSERT INTO update_metadata (
+            source,
+            last_request,
+            last_successful_update,
+            last_mode,
+            rows_seen,
+            rows_inserted
+        )
+        VALUES ('malware_bazaar', ?2, NULL, ?1, 0, 0)
+        ON CONFLICT(source) DO UPDATE SET
+            last_request = excluded.last_request
+        WHERE update_metadata.last_request <= ?3
+        "#,
+        params![mode, now, cutoff],
+    )?;
+
+    let claim = if changed == 1 {
+        RequestClaim::Allowed
+    } else {
+        let last_request: i64 = tx.query_row(
+            "SELECT last_request FROM update_metadata WHERE source = 'malware_bazaar'",
+            [],
+            |row| row.get(0),
+        )?;
+        RequestClaim::RateLimited {
+            retry_at: last_request.saturating_add(MALWARE_BAZAAR_REQUEST_INTERVAL_SECONDS),
+        }
+    };
+
+    tx.commit()?;
+    Ok(claim)
+}
+
+/// Record the outcome of a successfully completed Malware Bazaar update.
+fn record_successful_malware_bazaar_update(
+    path: impl AsRef<Path>,
+    mode: &str,
+    counts: UpdateCounts,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rows_seen = i64::try_from(counts.rows_seen)?;
+    let rows_inserted = i64::try_from(counts.rows_inserted)?;
+    let connection = Connection::open(path)?;
+    let changed = connection.execute(
+        r#"
+        UPDATE update_metadata
+        SET last_successful_update = unixepoch(),
+            last_mode = ?1,
+            rows_seen = ?2,
+            rows_inserted = ?3
+        WHERE source = 'malware_bazaar'
+        "#,
+        params![mode, rows_seen, rows_inserted],
+    )?;
+
+    if changed != 1 {
+        return Err("Malware Bazaar request metadata is missing".into());
+    }
+
     Ok(())
 }
 
@@ -220,7 +398,7 @@ fn fetch_malware_bazaar_recent_hashes(
 fn fetch_malware_bazaar_full_hashes(
     auth_key: &str,
     db_path: impl AsRef<Path>,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<UpdateCounts, Box<dyn std::error::Error>> {
     let url = format!(
         "https://mb-api.abuse.ch/v2/files/exports/{}/sha256_full.txt.zip",
         auth_key
@@ -245,11 +423,12 @@ fn fetch_malware_bazaar_full_hashes(
 fn insert_malware_bazaar_hashes(
     db_path: impl AsRef<Path>,
     samples: &[MalwareBazaarSample],
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<UpdateCounts, Box<dyn std::error::Error>> {
     let mut connection = Connection::open(db_path)?;
     let tx = connection.transaction()?;
 
     let mut inserted = 0;
+    let mut seen = 0;
 
     {
         let mut query = tx.prepare(
@@ -275,6 +454,7 @@ fn insert_malware_bazaar_hashes(
             let Some(sha256_bytes) = decode_sha256_hex(&sample.sha256_hash) else {
                 continue;
             };
+            seen += 1;
 
             let first_seen = parse_malware_bazaar_timestamp(sample.first_seen.as_deref());
 
@@ -291,17 +471,21 @@ fn insert_malware_bazaar_hashes(
 
     tx.commit()?;
 
-    Ok(inserted)
+    Ok(UpdateCounts {
+        rows_seen: seen,
+        rows_inserted: inserted,
+    })
 }
 
 fn insert_hash_lines<R: BufRead>(
     db_path: impl AsRef<Path>,
     reader: R,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<UpdateCounts, Box<dyn std::error::Error>> {
     let mut connection = Connection::open(db_path)?;
     let tx = connection.transaction()?;
 
     let mut inserted = 0;
+    let mut seen = 0;
 
     {
         let mut stmt = tx.prepare(
@@ -331,13 +515,17 @@ fn insert_hash_lines<R: BufRead>(
                 continue;
             };
 
+            seen += 1;
             inserted += stmt.execute(params![&hash_bytes[..]])?;
         }
     }
 
     tx.commit()?;
 
-    Ok(inserted)
+    Ok(UpdateCounts {
+        rows_seen: seen,
+        rows_inserted: inserted,
+    })
 }
 
 /// Utility function to decode a SHA256 hash and confirm it is valid.
@@ -428,9 +616,14 @@ mod tests {
             &self,
             _auth_key: &str,
             _db_path: &Path,
-        ) -> Result<usize, Box<dyn std::error::Error>> {
+        ) -> Result<UpdateCounts, Box<dyn std::error::Error>> {
             self.full_calls.set(self.full_calls.get() + 1);
-            self.full.map_err(|err| String::from(err).into())
+            self.full
+                .map(|count| UpdateCounts {
+                    rows_seen: count,
+                    rows_inserted: count,
+                })
+                .map_err(|err| String::from(err).into())
         }
     }
 
@@ -521,6 +714,106 @@ mod tests {
     }
 
     #[test]
+    fn create_database_tables_creates_non_null_last_request_column() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+
+        create_database_tables(file.path()).unwrap();
+
+        let connection = Connection::open(file.path()).unwrap();
+        let not_null: i64 = connection
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('update_metadata') WHERE name = 'last_request'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(not_null, 1);
+    }
+
+    #[test]
+    fn create_database_tables_migrates_legacy_metadata() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE update_metadata (
+                    source TEXT PRIMARY KEY NOT NULL,
+                    last_successful_update INTEGER,
+                    last_mode TEXT NOT NULL,
+                    rows_seen INTEGER NOT NULL,
+                    rows_inserted INTEGER NOT NULL
+                );
+                INSERT INTO update_metadata
+                    (source, last_successful_update, last_mode, rows_seen, rows_inserted)
+                VALUES ('malware_bazaar', 42, 'full', 10, 8);
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        create_database_tables(file.path()).unwrap();
+
+        let connection = Connection::open(file.path()).unwrap();
+        let metadata: (i64, i64, String, i64, i64) = connection
+            .query_row(
+                r#"
+                SELECT last_request, last_successful_update, last_mode, rows_seen, rows_inserted
+                FROM update_metadata
+                WHERE source = 'malware_bazaar'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(metadata, (42, 42, "full".to_string(), 10, 8));
+    }
+
+    #[test]
+    fn malware_bazaar_request_claim_enforces_interval_boundaries() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+
+        assert_eq!(
+            claim_malware_bazaar_request(file.path(), "full", 100).unwrap(),
+            RequestClaim::Allowed
+        );
+        assert_eq!(
+            claim_malware_bazaar_request(file.path(), "recent", 3_699).unwrap(),
+            RequestClaim::RateLimited { retry_at: 3_700 }
+        );
+        assert_eq!(
+            claim_malware_bazaar_request(file.path(), "recent", 3_700).unwrap(),
+            RequestClaim::Allowed
+        );
+    }
+
+    #[test]
+    fn malware_bazaar_request_claim_is_shared_across_modes_and_callers() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+
+        assert_eq!(
+            claim_malware_bazaar_request(file.path(), "full", 10_000).unwrap(),
+            RequestClaim::Allowed
+        );
+        assert_eq!(
+            claim_malware_bazaar_request(file.path(), "recent", 10_000).unwrap(),
+            RequestClaim::RateLimited { retry_at: 13_600 }
+        );
+    }
+
+    #[test]
     fn insert_hash_lines_skips_comments_blanks_invalid_and_duplicates() {
         let file = tempfile::NamedTempFile::new().unwrap();
         create_database_tables(file.path()).unwrap();
@@ -539,7 +832,13 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
             .query_row("SELECT COUNT(*) FROM malware_hashes", [], |row| row.get(0))
             .unwrap();
 
-        assert_eq!(inserted, 2);
+        assert_eq!(
+            inserted,
+            UpdateCounts {
+                rows_seen: 3,
+                rows_inserted: 2,
+            }
+        );
         assert_eq!(count, 2);
     }
 
@@ -550,7 +849,13 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 
         let inserted = insert_hash_lines(file.path(), Cursor::new(b"\n # not-a-hash\n\n")).unwrap();
 
-        assert_eq!(inserted, 0);
+        assert_eq!(
+            inserted,
+            UpdateCounts {
+                rows_seen: 0,
+                rows_inserted: 0,
+            }
+        );
         assert_eq!(malware_hash_count(file.path()).unwrap(), 0);
     }
 
@@ -592,7 +897,13 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
             )
             .unwrap();
 
-        assert_eq!(inserted, 2);
+        assert_eq!(
+            inserted,
+            UpdateCounts {
+                rows_seen: 2,
+                rows_inserted: 2,
+            }
+        );
         assert_eq!(count, 2);
         assert_eq!(family, "family-a");
         assert_eq!(first_seen, 1);
@@ -606,12 +917,18 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 
         assert_eq!(
             insert_malware_bazaar_hashes(file.path(), &[sample(hash, Some("old"), None)]).unwrap(),
-            1
+            UpdateCounts {
+                rows_seen: 1,
+                rows_inserted: 1,
+            }
         );
         assert_eq!(
             insert_malware_bazaar_hashes(file.path(), &[sample(hash, Some("new"), Some("elf"))])
                 .unwrap(),
-            1
+            UpdateCounts {
+                rows_seen: 1,
+                rows_inserted: 1,
+            }
         );
 
         let connection = Connection::open(file.path()).unwrap();
@@ -652,7 +969,7 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
         let updated =
             update_signatures_with_client("auth", "selector", file.path(), &client).unwrap();
 
-        assert_eq!(updated, 7);
+        assert_eq!(updated, UpdateSignaturesOutcome::Updated(7));
         assert_eq!(client.full_calls.get(), 1);
         assert_eq!(client.recent_calls.get(), 0);
     }
@@ -678,7 +995,7 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
         let updated =
             update_signatures_with_client("auth", "selector", file.path(), &client).unwrap();
 
-        assert_eq!(updated, 1);
+        assert_eq!(updated, UpdateSignaturesOutcome::Updated(1));
         assert_eq!(malware_hash_count(file.path()).unwrap(), 2);
         assert_eq!(client.full_calls.get(), 0);
         assert_eq!(client.recent_calls.get(), 1);
@@ -698,10 +1015,155 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
         let updated =
             update_signatures_with_client("auth", "selector", file.path(), &client).unwrap();
 
-        assert_eq!(updated, 0);
+        assert_eq!(updated, UpdateSignaturesOutcome::Updated(0));
         assert_eq!(malware_hash_count(file.path()).unwrap(), 1);
         assert_eq!(client.full_calls.get(), 0);
         assert_eq!(client.recent_calls.get(), 1);
+    }
+
+    #[test]
+    fn update_signatures_records_successful_recent_update_metadata() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+        insert_hash_lines(
+            file.path(),
+            Cursor::new(b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n"),
+        )
+        .unwrap();
+        let client = FakeMalwareBazaarClient::new(
+            Ok(vec![
+                sample(
+                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    Some("family"),
+                    Some("elf"),
+                ),
+                sample("invalid", None, None),
+            ]),
+            Ok(99),
+        );
+
+        update_signatures_with_client("auth", "selector", file.path(), &client).unwrap();
+
+        let connection = Connection::open(file.path()).unwrap();
+        let metadata: (i64, i64, String, i64, i64) = connection
+            .query_row(
+                r#"
+                SELECT last_request, last_successful_update, last_mode, rows_seen, rows_inserted
+                FROM update_metadata
+                WHERE source = 'malware_bazaar'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert!(metadata.0 > 0);
+        assert!(metadata.1 >= metadata.0);
+        assert_eq!(metadata.2, "recent");
+        assert_eq!(metadata.3, 1);
+        assert_eq!(metadata.4, 1);
+    }
+
+    #[test]
+    fn update_signatures_records_failed_request_without_replacing_success_metadata() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+        insert_hash_lines(
+            file.path(),
+            Cursor::new(b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n"),
+        )
+        .unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute(
+                r#"
+                INSERT INTO update_metadata (
+                    source, last_request, last_successful_update, last_mode, rows_seen, rows_inserted
+                )
+                VALUES ('malware_bazaar', 1, 1, 'full', 10, 8)
+                "#,
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let client = FakeMalwareBazaarClient::new(Err("recent failed"), Ok(99));
+
+        let err =
+            update_signatures_with_client("auth", "selector", file.path(), &client).unwrap_err();
+
+        assert_eq!(
+            err,
+            UpdateSignaturesError::RecentFetch("recent failed".to_string())
+        );
+        let retry =
+            update_signatures_with_client("auth", "selector", file.path(), &client).unwrap();
+        assert!(matches!(
+            retry,
+            UpdateSignaturesOutcome::RateLimited { retry_at } if retry_at > chrono::Utc::now().timestamp()
+        ));
+        assert_eq!(client.recent_calls.get(), 1);
+
+        let connection = Connection::open(file.path()).unwrap();
+        let metadata: (i64, Option<i64>, String, i64, i64) = connection
+            .query_row(
+                r#"
+                SELECT last_request, last_successful_update, last_mode, rows_seen, rows_inserted
+                FROM update_metadata
+                WHERE source = 'malware_bazaar'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert!(metadata.0 > 1);
+        assert_eq!(metadata.1, Some(1));
+        assert_eq!(metadata.2, "full");
+        assert_eq!(metadata.3, 10);
+        assert_eq!(metadata.4, 8);
+    }
+
+    #[test]
+    fn update_signatures_does_not_request_when_metadata_cannot_be_written() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER reject_metadata_insert
+                BEFORE INSERT ON update_metadata
+                BEGIN
+                    SELECT RAISE(FAIL, 'metadata unavailable');
+                END;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+        let client = FakeMalwareBazaarClient::new(Ok(vec![]), Ok(7));
+
+        let err =
+            update_signatures_with_client("auth", "selector", file.path(), &client).unwrap_err();
+
+        assert!(matches!(err, UpdateSignaturesError::DatabaseMetadata(_)));
+        assert_eq!(client.full_calls.get(), 0);
+        assert_eq!(client.recent_calls.get(), 0);
     }
 
     #[test]
@@ -751,6 +1213,10 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
             (
                 UpdateSignaturesError::DatabaseCount("count failed".to_string()),
                 "count failed",
+            ),
+            (
+                UpdateSignaturesError::DatabaseMetadata("metadata failed".to_string()),
+                "metadata failed",
             ),
             (
                 UpdateSignaturesError::FullFetch("full failed".to_string()),

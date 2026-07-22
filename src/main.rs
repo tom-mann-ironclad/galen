@@ -17,7 +17,9 @@ use crate::scanner::{
     yara::load_yara_rules_cache,
 };
 use crate::updater::{
-    update_signatures::{UpdateSignaturesError, update_signatures_using_malware_bazaar},
+    update_signatures::{
+        UpdateSignaturesError, UpdateSignaturesOutcome, update_signatures_using_malware_bazaar,
+    },
     update_yara_rules::{UpdateYaraRulesError, update_yara_rules},
 };
 
@@ -346,8 +348,11 @@ where
 
 /// Backend boundary for update side effects so command handling can be unit tested.
 trait UpdateBackend {
-    /// Update malware signatures and return the number of processed rows.
-    fn update_signatures(&self, args: &UpdateArgs) -> Result<usize, UpdateSignaturesError>;
+    /// Update malware signatures and report whether rows were processed or the request was skipped.
+    fn update_signatures(
+        &self,
+        args: &UpdateArgs,
+    ) -> Result<UpdateSignaturesOutcome, UpdateSignaturesError>;
 
     /// Update compiled YARA rules and return the number of compiled rules.
     fn update_yara_rules(&self, args: &UpdateArgs) -> Result<usize, UpdateYaraRulesError>;
@@ -358,7 +363,10 @@ struct RealUpdateBackend;
 
 #[cfg(not(tarpaulin))]
 impl UpdateBackend for RealUpdateBackend {
-    fn update_signatures(&self, args: &UpdateArgs) -> Result<usize, UpdateSignaturesError> {
+    fn update_signatures(
+        &self,
+        args: &UpdateArgs,
+    ) -> Result<UpdateSignaturesOutcome, UpdateSignaturesError> {
         update_signatures_using_malware_bazaar(&args.auth_key, "100", &args.database)
     }
 
@@ -369,7 +377,10 @@ impl UpdateBackend for RealUpdateBackend {
 
 #[cfg(tarpaulin)]
 impl UpdateBackend for RealUpdateBackend {
-    fn update_signatures(&self, _args: &UpdateArgs) -> Result<usize, UpdateSignaturesError> {
+    fn update_signatures(
+        &self,
+        _args: &UpdateArgs,
+    ) -> Result<UpdateSignaturesOutcome, UpdateSignaturesError> {
         Err(UpdateSignaturesError::NetworkUpdateDisabled)
     }
 
@@ -392,11 +403,20 @@ where
 {
     let _ = writeln!(stderr, "Updating malware signatures...");
     match backend.update_signatures(args) {
-        Ok(inserted) => {
+        Ok(UpdateSignaturesOutcome::Updated(inserted)) => {
             let _ = writeln!(
                 stdout,
                 "Processed {:?} signatures from Malware Bazaar",
                 inserted
+            );
+        }
+        Ok(UpdateSignaturesOutcome::RateLimited { retry_at }) => {
+            let retry_at = chrono::DateTime::from_timestamp(retry_at, 0)
+                .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| format!("Unix timestamp {retry_at}"));
+            let _ = writeln!(
+                stdout,
+                "Skipped Malware Bazaar update: rate limit active; retry after {retry_at}"
             );
         }
         Err(err) => {
@@ -480,12 +500,15 @@ mod tests {
 
     /// Backend used in testing as a mock.
     struct FakeUpdateBackend {
-        signatures: Result<usize, UpdateSignaturesError>,
+        signatures: Result<UpdateSignaturesOutcome, UpdateSignaturesError>,
         yara_rules: Result<usize, UpdateYaraRulesError>,
     }
 
     impl UpdateBackend for FakeUpdateBackend {
-        fn update_signatures(&self, _args: &UpdateArgs) -> Result<usize, UpdateSignaturesError> {
+        fn update_signatures(
+            &self,
+            _args: &UpdateArgs,
+        ) -> Result<UpdateSignaturesOutcome, UpdateSignaturesError> {
             self.signatures.clone()
         }
 
@@ -1219,7 +1242,7 @@ Options:
     #[test]
     fn update_command_preserves_stdout_and_stderr_split() {
         let backend = FakeUpdateBackend {
-            signatures: Ok(3),
+            signatures: Ok(UpdateSignaturesOutcome::Updated(3)),
             yara_rules: Ok(2),
         };
         let mut stdout = Vec::new();
@@ -1259,9 +1282,30 @@ Options:
     }
 
     #[test]
+    fn update_command_reports_rate_limit_and_continues_with_yara_update() {
+        let backend = FakeUpdateBackend {
+            signatures: Ok(UpdateSignaturesOutcome::RateLimited { retry_at: 3_600 }),
+            yara_rules: Ok(2),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = run_update_command(&update_args(), &backend, &mut stdout, &mut stderr);
+        let stdout = String::from_utf8(stdout).unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+
+        assert_eq!(exit_code, EXIT_SUCCESS);
+        assert!(stdout.contains("Skipped Malware Bazaar update: rate limit active"));
+        assert!(stdout.contains("1970-01-01 01:00:00 UTC"));
+        assert!(stdout.contains("Compiled 2 rules into cache"));
+        assert!(stderr.contains("Updating malware signatures"));
+        assert!(stderr.contains("Updating YARA rules"));
+    }
+
+    #[test]
     fn update_command_reports_yara_update_failure() {
         let backend = FakeUpdateBackend {
-            signatures: Ok(3),
+            signatures: Ok(UpdateSignaturesOutcome::Updated(3)),
             yara_rules: Err(UpdateYaraRulesError::RuleCompile {
                 path: PathBuf::from("rules/bad.yar"),
                 error: "invalid rule".to_string(),

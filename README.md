@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/tom-mann-ironclad/galen/actions/workflows/ci.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/ci.yaml)
 [![Nightly Packages](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml)
-[![Code Coverage](https://img.shields.io/badge/coverage-81.2%25-brightgreen)](#testing-and-build-assurance)
-[![Mutation Score](https://img.shields.io/badge/mutation_score-81.1%25-brightgreen)](#testing-and-build-assurance)
+[![Code Coverage](https://img.shields.io/badge/coverage-81.8%25-brightgreen)](#testing-and-build-assurance)
+[![Mutation Score](https://img.shields.io/badge/mutation_score-83.5%25-brightgreen)](#testing-and-build-assurance)
 ![GitHub License](https://img.shields.io/github/license/tom-mann-ironclad/galen)
 
 Galen is an alpha-stage static malware scanner and security intelligence pipeline for Linux, written in Rust.
@@ -91,6 +91,9 @@ To update the local Malware Bazaar-derived signature database, first provide a M
 export GALEN_AUTH_KEY="your-api-key"
 galen update
 ```
+
+Galen limits Malware Bazaar requests to one per 60 minutes in accordance with the Fair Use policy. Requests attempted during the
+cooldown are skipped with the next permitted request time displayed; other update work continues.
 
 Scan a directory:
 
@@ -425,8 +428,8 @@ Current testing includes:
 Current measured coverage is approximately:
 
 ```text
-Code coverage: 81.1%
-Mutation score: 81.1%
+Code coverage: 81.8%
+Mutation score: 83.5%
 ```
 
 Fuzzing is being added for parser, archive, and hostile-input paths. Surviving mutants are also being reviewed and documented where they expose meaningful gaps or deliberate equivalences.
