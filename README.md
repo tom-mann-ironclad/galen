@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/tom-mann-ironclad/galen/actions/workflows/ci.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/ci.yaml)
 [![Nightly Packages](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml)
-[![Code Coverage](https://img.shields.io/badge/coverage-81.8%25-brightgreen)](#testing-and-build-assurance)
-[![Mutation Score](https://img.shields.io/badge/mutation_score-83.5%25-brightgreen)](#testing-and-build-assurance)
+[![Code Coverage](https://img.shields.io/badge/coverage-82.1%25-brightgreen)](#testing-and-build-assurance)
+[![Mutation Score](https://img.shields.io/badge/mutation_score-86.7%25-brightgreen)](#testing-and-build-assurance)
 ![GitHub License](https://img.shields.io/github/license/tom-mann-ironclad/galen)
 
 Galen is an alpha-stage static malware scanner and security intelligence pipeline for Linux, written in Rust.
@@ -424,13 +424,6 @@ Current testing includes:
 * False-positive testing against Debian
 * False-positive testing against Fedora
 * False-positive testing against Arch Linux
-
-Current measured coverage is approximately:
-
-```text
-Code coverage: 81.8%
-Mutation score: 83.5%
-```
 
 Fuzzing is being added for parser, archive, and hostile-input paths. Surviving mutants are also being reviewed and documented where they expose meaningful gaps or deliberate equivalences.
 

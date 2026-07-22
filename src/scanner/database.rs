@@ -1,12 +1,17 @@
 use super::hash::FileHashes;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 const SHA256_QUERY: &str = "SELECT sha256 FROM malware_hashes ORDER BY sha256";
+const UPDATE_METADATA_TABLE_EXISTS_QUERY: &str =
+    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'update_metadata')";
+const LAST_SUCCESSFUL_UPDATE_QUERY: &str =
+    "SELECT last_successful_update FROM update_metadata WHERE source = 'malware_bazaar'";
 
 #[derive(Debug, Default)]
 pub struct HashDatabase {
     sha256: Vec<[u8; 32]>,
+    last_successful_update: Option<i64>,
 }
 
 impl HashDatabase {
@@ -23,6 +28,11 @@ impl HashDatabase {
     /// Function to get if the database is empty.
     pub fn is_empty(&self) -> bool {
         self.sha256.is_empty()
+    }
+
+    /// Return the Unix timestamp of the last successful Malware Bazaar update, if known.
+    pub fn last_successful_update(&self) -> Option<i64> {
+        self.last_successful_update
     }
 }
 
@@ -52,6 +62,15 @@ pub fn load_hash_database(path: impl AsRef<Path>) -> Result<HashDatabase, rusqli
     database.sha256.sort_unstable();
     database.sha256.dedup();
 
+    let has_update_metadata: bool =
+        connection.query_row(UPDATE_METADATA_TABLE_EXISTS_QUERY, [], |row| row.get(0))?;
+    if has_update_metadata {
+        database.last_successful_update = connection
+            .query_row(LAST_SUCCESSFUL_UPDATE_QUERY, [], |row| row.get(0))
+            .optional()?
+            .flatten();
+    }
+
     Ok(database)
 }
 
@@ -68,6 +87,7 @@ mod tests {
     fn contains_uses_sorted_hashes() {
         let database = HashDatabase {
             sha256: vec![hash(1), hash(3), hash(9)],
+            last_successful_update: None,
         };
 
         assert!(!database.is_empty());
@@ -80,7 +100,8 @@ mod tests {
         assert!(HashDatabase::default().is_empty());
         assert!(
             !HashDatabase {
-                sha256: vec![hash(1)]
+                sha256: vec![hash(1)],
+                ..HashDatabase::default()
             }
             .is_empty()
         );
@@ -107,6 +128,31 @@ mod tests {
         assert_eq!(database.len(), 2);
         assert!(database.contains(&FileHashes { sha256: hash(1) }));
         assert!(database.contains(&FileHashes { sha256: hash(9) }));
+        assert_eq!(database.last_successful_update(), None);
+    }
+
+    #[test]
+    fn load_hash_database_reads_last_successful_update() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE malware_hashes (sha256 BLOB NOT NULL);
+                CREATE TABLE update_metadata (
+                    source TEXT PRIMARY KEY NOT NULL,
+                    last_successful_update INTEGER
+                );
+                INSERT INTO update_metadata (source, last_successful_update)
+                VALUES ('malware_bazaar', 1234);
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = load_hash_database(file.path()).unwrap();
+
+        assert_eq!(database.last_successful_update(), Some(1234));
     }
 
     #[test]

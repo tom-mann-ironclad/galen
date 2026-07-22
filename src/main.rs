@@ -30,6 +30,7 @@ use crate::json::{ErrorReport, ScanReport};
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_DETECTIONS: i32 = 1;
 const EXIT_OPERATIONAL_ERROR: i32 = 2;
+const HASH_DATABASE_MAX_AGE_SECONDS: i64 = 7 * 24 * 60 * 60;
 const YARA_MAX_SCAN_SIZE: usize = 4 * 1024 * 1024;
 const YARA_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -89,6 +90,12 @@ where
         }
     };
     let _ = writeln!(stderr, "{:?} signatures loaded", hash_database.len());
+    if let Some(warning) = hash_database_freshness_warning(
+        hash_database.last_successful_update(),
+        chrono::Utc::now().timestamp(),
+    ) {
+        let _ = writeln!(stderr, "Warning: {warning}");
+    }
 
     let _ = writeln!(
         stderr,
@@ -123,6 +130,33 @@ where
         OutputFormat::Json => write_json_scan_report(&summary, scan_time, stdout, stderr)
             .unwrap_or(EXIT_OPERATIONAL_ERROR),
     }
+}
+
+/// Return a warning when the Malware Bazaar hash data is missing freshness metadata or is stale.
+fn hash_database_freshness_warning(
+    last_successful_update: Option<i64>,
+    now: i64,
+) -> Option<String> {
+    let Some(last_successful_update) = last_successful_update else {
+        return Some(
+            "malware hash database update time is unavailable; run `galen update`".to_string(),
+        );
+    };
+
+    if now.saturating_sub(last_successful_update) < HASH_DATABASE_MAX_AGE_SECONDS {
+        return None;
+    }
+
+    Some(format!(
+        "malware hash database may be stale (last updated {}); run `galen update`",
+        format_utc_timestamp(last_successful_update)
+    ))
+}
+
+fn format_utc_timestamp(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| format!("Unix timestamp {timestamp}"))
 }
 
 /// Write a JSON operational error report to stdout.
@@ -411,9 +445,7 @@ where
             );
         }
         Ok(UpdateSignaturesOutcome::RateLimited { retry_at }) => {
-            let retry_at = chrono::DateTime::from_timestamp(retry_at, 0)
-                .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                .unwrap_or_else(|| format!("Unix timestamp {retry_at}"));
+            let retry_at = format_utc_timestamp(retry_at);
             let _ = writeln!(
                 stdout,
                 "Skipped Malware Bazaar update: rate limit active; retry after {retry_at}"
@@ -1126,7 +1158,28 @@ Options:
         assert!(stdout.contains("Scanned 1 file"));
         assert!(stdout.contains("Detection records: 0"));
         assert!(stderr.contains("Loading"));
+        assert!(stderr.contains("Warning: malware hash database update time is unavailable"));
         assert!(stderr.contains("Starting scan"));
+    }
+
+    #[test]
+    fn hash_database_freshness_warning_uses_one_week_boundary() {
+        let week = HASH_DATABASE_MAX_AGE_SECONDS;
+
+        assert_eq!(hash_database_freshness_warning(Some(1), week), None);
+        assert_eq!(
+            hash_database_freshness_warning(Some(0), week),
+            Some(
+                "malware hash database may be stale (last updated 1970-01-01 00:00:00 UTC); run `galen update`"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            hash_database_freshness_warning(None, week),
+            Some(
+                "malware hash database update time is unavailable; run `galen update`".to_string()
+            )
+        );
     }
 
     #[test]
