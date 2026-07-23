@@ -2,7 +2,7 @@ use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Deserializer};
 #[cfg(not(tarpaulin))]
 use std::io::{BufReader, Seek, SeekFrom, copy};
-use std::{fmt, io::BufRead, path::Path};
+use std::{fmt, fs::File, io::BufRead, path::Path};
 
 const CREATE_METADATA_TABLE: &str = r#"
         CREATE TABLE IF NOT EXISTS update_metadata (
@@ -87,8 +87,12 @@ pub enum UpdateSignaturesOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateSignaturesError {
     DatabaseSetup(String),
+    DatabaseValidation(String),
     DatabaseCount(String),
     DatabaseMetadata(String),
+    InvalidResponse(String),
+    DatabaseStage(String),
+    DatabaseReplace(String),
     FullFetch(String),
     RecentFetch(String),
     DatabaseInsert(String),
@@ -99,8 +103,12 @@ impl fmt::Display for UpdateSignaturesError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             UpdateSignaturesError::DatabaseSetup(err)
+            | UpdateSignaturesError::DatabaseValidation(err)
             | UpdateSignaturesError::DatabaseCount(err)
             | UpdateSignaturesError::DatabaseMetadata(err)
+            | UpdateSignaturesError::InvalidResponse(err)
+            | UpdateSignaturesError::DatabaseStage(err)
+            | UpdateSignaturesError::DatabaseReplace(err)
             | UpdateSignaturesError::FullFetch(err)
             | UpdateSignaturesError::RecentFetch(err)
             | UpdateSignaturesError::DatabaseInsert(err) => write!(formatter, "{err}"),
@@ -112,6 +120,13 @@ impl fmt::Display for UpdateSignaturesError {
 }
 
 impl std::error::Error for UpdateSignaturesError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseState {
+    Missing,
+    Uninitialised,
+    Valid,
+}
 
 /// Function to update the signatures database from Malware Bazaar.
 #[cfg(not(tarpaulin))]
@@ -170,30 +185,21 @@ fn update_signatures_with_client(
     db_path: &Path,
     client: &impl MalwareBazaarClient,
 ) -> Result<UpdateSignaturesOutcome, UpdateSignaturesError> {
-    create_database_tables(db_path)
-        .map_err(|err| UpdateSignaturesError::DatabaseSetup(err.to_string()))?;
-    let existing_entries = match malware_hash_count(db_path) {
-        Ok(count) => count,
-        Err(err) => return Err(UpdateSignaturesError::DatabaseCount(err.to_string())),
+    let state = inspect_database(db_path)
+        .map_err(|err| UpdateSignaturesError::DatabaseValidation(err.to_string()))?;
+    let existing_entries = if state == DatabaseState::Valid {
+        create_database_tables(db_path)
+            .map_err(|err| UpdateSignaturesError::DatabaseSetup(err.to_string()))?;
+        malware_hash_count(db_path)
+            .map_err(|err| UpdateSignaturesError::DatabaseCount(err.to_string()))?
+    } else {
+        0
     };
 
     // If we have no malware signatures we need to bootstrap the database.
     if existing_entries == 0 {
         eprintln!("Empty database found, bootstrapping...");
-        if let RequestClaim::RateLimited { retry_at } =
-            claim_malware_bazaar_request(db_path, "full", chrono::Utc::now().timestamp())
-                .map_err(|err| UpdateSignaturesError::DatabaseMetadata(err.to_string()))?
-        {
-            return Ok(UpdateSignaturesOutcome::RateLimited { retry_at });
-        }
-        match client.fetch_full(auth_key, db_path) {
-            Ok(counts) => {
-                record_successful_malware_bazaar_update(db_path, "full", counts)
-                    .map_err(|err| UpdateSignaturesError::DatabaseMetadata(err.to_string()))?;
-                return Ok(UpdateSignaturesOutcome::Updated(counts.rows_inserted));
-            }
-            Err(err) => return Err(UpdateSignaturesError::FullFetch(err.to_string())),
-        }
+        return bootstrap_database(auth_key, db_path, state, client);
     }
 
     if let RequestClaim::RateLimited { retry_at } =
@@ -207,14 +213,13 @@ fn update_signatures_with_client(
         Err(err) => return Err(UpdateSignaturesError::RecentFetch(err.to_string())),
     };
 
+    validate_recent_samples(&samples)
+        .map_err(|err| UpdateSignaturesError::InvalidResponse(err.to_string()))?;
+
     if !samples.is_empty() {
         eprintln!("Updating database with latest signatures...");
         match insert_malware_bazaar_hashes(db_path, &samples) {
-            Ok(counts) => {
-                record_successful_malware_bazaar_update(db_path, "recent", counts)
-                    .map_err(|err| UpdateSignaturesError::DatabaseMetadata(err.to_string()))?;
-                return Ok(UpdateSignaturesOutcome::Updated(counts.rows_inserted));
-            }
+            Ok(counts) => return Ok(UpdateSignaturesOutcome::Updated(counts.rows_inserted)),
             Err(err) => return Err(UpdateSignaturesError::DatabaseInsert(err.to_string())),
         }
     }
@@ -232,6 +237,79 @@ fn update_signatures_with_client(
     Ok(UpdateSignaturesOutcome::Updated(0))
 }
 
+fn bootstrap_database(
+    auth_key: &str,
+    db_path: &Path,
+    state: DatabaseState,
+    client: &impl MalwareBazaarClient,
+) -> Result<UpdateSignaturesOutcome, UpdateSignaturesError> {
+    let now = chrono::Utc::now().timestamp();
+    if state == DatabaseState::Valid
+        && let RequestClaim::RateLimited { retry_at } =
+            claim_malware_bazaar_request(db_path, "full", now)
+                .map_err(|err| UpdateSignaturesError::DatabaseMetadata(err.to_string()))?
+    {
+        return Ok(UpdateSignaturesOutcome::RateLimited { retry_at });
+    }
+
+    let parent = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staging = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| UpdateSignaturesError::DatabaseStage(err.to_string()))?;
+    create_database_tables(staging.path())
+        .map_err(|err| UpdateSignaturesError::DatabaseStage(err.to_string()))?;
+    claim_malware_bazaar_request(staging.path(), "full", now)
+        .map_err(|err| UpdateSignaturesError::DatabaseStage(err.to_string()))?;
+
+    let counts = client
+        .fetch_full(auth_key, staging.path())
+        .map_err(|err| UpdateSignaturesError::FullFetch(err.to_string()))?;
+    let staged_hashes = malware_hash_count(staging.path())
+        .map_err(|err| UpdateSignaturesError::DatabaseStage(err.to_string()))?;
+    if counts.rows_seen == 0 || staged_hashes == 0 {
+        return Err(UpdateSignaturesError::InvalidResponse(
+            "Malware Bazaar full export contained no valid hashes".to_string(),
+        ));
+    }
+    record_successful_malware_bazaar_update(staging.path(), "full", counts)
+        .map_err(|err| UpdateSignaturesError::DatabaseStage(err.to_string()))?;
+    match inspect_database(staging.path()) {
+        Ok(DatabaseState::Valid) => {}
+        Ok(_) => {
+            return Err(UpdateSignaturesError::DatabaseStage(
+                "staged signature database failed validation".to_string(),
+            ));
+        }
+        Err(err) => return Err(UpdateSignaturesError::DatabaseStage(err.to_string())),
+    }
+
+    if state != DatabaseState::Missing {
+        let permissions = std::fs::metadata(db_path)
+            .map_err(|err| UpdateSignaturesError::DatabaseReplace(err.to_string()))?
+            .permissions();
+        std::fs::set_permissions(staging.path(), permissions)
+            .map_err(|err| UpdateSignaturesError::DatabaseReplace(err.to_string()))?;
+    }
+    staging
+        .as_file()
+        .sync_all()
+        .map_err(|err| UpdateSignaturesError::DatabaseStage(err.to_string()))?;
+    let persisted = staging
+        .persist(db_path)
+        .map_err(|err| UpdateSignaturesError::DatabaseReplace(err.error.to_string()))?;
+    persisted
+        .sync_all()
+        .map_err(|err| UpdateSignaturesError::DatabaseReplace(err.to_string()))?;
+    #[cfg(unix)]
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| UpdateSignaturesError::DatabaseReplace(err.to_string()))?;
+
+    Ok(UpdateSignaturesOutcome::Updated(counts.rows_inserted))
+}
+
 #[cfg(tarpaulin)]
 pub fn update_signatures_using_malware_bazaar(
     _auth_key: &str,
@@ -239,6 +317,84 @@ pub fn update_signatures_using_malware_bazaar(
     _db_path: impl AsRef<Path>,
 ) -> Result<UpdateSignaturesOutcome, UpdateSignaturesError> {
     Err(UpdateSignaturesError::NetworkUpdateDisabled)
+}
+
+fn inspect_database(path: &Path) -> Result<DatabaseState, Box<dyn std::error::Error>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DatabaseState::Missing);
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Err("signature database path must not be a symbolic link".into());
+    }
+    if !metadata.is_file() {
+        return Err("signature database path must be a regular file".into());
+    }
+
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if quick_check != "ok" {
+        return Err(format!("SQLite quick_check failed: {quick_check}").into());
+    }
+
+    let table_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_count == 0 {
+        return Ok(DatabaseState::Uninitialised);
+    }
+
+    let malware_columns = table_columns(&connection, "malware_hashes")?;
+    let expected_malware = [
+        "family",
+        "file_type",
+        "first_seen",
+        "imported_at",
+        "sha256",
+        "source",
+    ];
+    if malware_columns != expected_malware {
+        return Err("signature database has an incompatible malware_hashes schema".into());
+    }
+
+    let metadata_columns = table_columns(&connection, "update_metadata")?;
+    let legacy_metadata = [
+        "last_mode",
+        "last_successful_update",
+        "rows_inserted",
+        "rows_seen",
+        "source",
+    ];
+    let current_metadata = [
+        "last_mode",
+        "last_request",
+        "last_successful_update",
+        "rows_inserted",
+        "rows_seen",
+        "source",
+    ];
+    if !metadata_columns.is_empty()
+        && metadata_columns != legacy_metadata
+        && metadata_columns != current_metadata
+    {
+        return Err("signature database has an incompatible update_metadata schema".into());
+    }
+
+    Ok(DatabaseState::Valid)
+}
+
+fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>, rusqlite::Error> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut names = columns.collect::<Result<Vec<_>, _>>()?;
+    names.sort_unstable();
+    Ok(names)
 }
 
 /// Function to ensure that all required database tables exist.
@@ -412,10 +568,23 @@ fn fetch_malware_bazaar_full_hashes(
         auth_key
     );
     let mut response = ureq::get(&url).call()?;
+    let expected_length = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
 
     // Create a temporary file to store the large zip on disk while processing it.
     let mut tmp = tempfile::tempfile()?;
-    copy(&mut response.body_mut().as_reader(), &mut tmp)?;
+    let downloaded_length = copy(&mut response.body_mut().as_reader(), &mut tmp)?;
+    if let Some(expected_length) = expected_length
+        && expected_length != downloaded_length
+    {
+        return Err(format!(
+            "Malware Bazaar full export was truncated: expected {expected_length} bytes, received {downloaded_length}"
+        )
+        .into());
+    }
 
     tmp.seek(SeekFrom::Start(0))?;
 
@@ -427,11 +596,28 @@ fn fetch_malware_bazaar_full_hashes(
     insert_hash_lines(db_path, reader)
 }
 
+fn validate_recent_samples(
+    samples: &[MalwareBazaarSample],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (index, sample) in samples.iter().enumerate() {
+        if decode_sha256_hex(&sample.sha256_hash).is_none() {
+            return Err(format!("sample {index} contains an invalid SHA-256 hash").into());
+        }
+        if sample.first_seen.is_some()
+            && parse_malware_bazaar_timestamp(sample.first_seen.as_deref()).is_none()
+        {
+            return Err(format!("sample {index} contains an invalid first_seen timestamp").into());
+        }
+    }
+    Ok(())
+}
+
 /// Function to insert malware hashes from Malware Bazaar into the database.
 fn insert_malware_bazaar_hashes(
     db_path: impl AsRef<Path>,
     samples: &[MalwareBazaarSample],
 ) -> Result<UpdateCounts, Box<dyn std::error::Error>> {
+    validate_recent_samples(samples)?;
     let mut connection = open_existing_database(db_path)?;
     let tx = connection.transaction()?;
 
@@ -459,9 +645,8 @@ fn insert_malware_bazaar_hashes(
         )?;
 
         for sample in samples {
-            let Some(sha256_bytes) = decode_sha256_hex(&sample.sha256_hash) else {
-                continue;
-            };
+            let sha256_bytes = decode_sha256_hex(&sample.sha256_hash)
+                .ok_or("validated Malware Bazaar hash unexpectedly became invalid")?;
             seen += 1;
 
             let first_seen = parse_malware_bazaar_timestamp(sample.first_seen.as_deref());
@@ -475,6 +660,23 @@ fn insert_malware_bazaar_hashes(
 
             inserted += changed;
         }
+    }
+
+    let rows_seen = i64::try_from(seen)?;
+    let rows_inserted = i64::try_from(inserted)?;
+    let changed = tx.execute(
+        r#"
+        UPDATE update_metadata
+        SET last_successful_update = unixepoch(),
+            last_mode = 'recent',
+            rows_seen = ?1,
+            rows_inserted = ?2
+        WHERE source = 'malware_bazaar'
+        "#,
+        params![rows_seen, rows_inserted],
+    )?;
+    if changed != 1 {
+        return Err("Malware Bazaar request metadata is missing".into());
     }
 
     tx.commit()?;
@@ -519,9 +721,8 @@ fn insert_hash_lines<R: BufRead>(
                 continue;
             }
 
-            let Some(hash_bytes) = decode_sha256_hex(hash) else {
-                continue;
-            };
+            let hash_bytes = decode_sha256_hex(hash)
+                .ok_or_else(|| format!("full export contains an invalid SHA-256 hash: {hash}"))?;
 
             seen += 1;
             inserted += stmt.execute(params![&hash_bytes[..]])?;
@@ -623,15 +824,14 @@ mod tests {
         fn fetch_full(
             &self,
             _auth_key: &str,
-            _db_path: &Path,
+            db_path: &Path,
         ) -> Result<UpdateCounts, Box<dyn std::error::Error>> {
             self.full_calls.set(self.full_calls.get() + 1);
-            self.full
-                .map(|count| UpdateCounts {
-                    rows_seen: count,
-                    rows_inserted: count,
-                })
-                .map_err(|err| String::from(err).into())
+            let count = self.full.map_err(String::from)?;
+            let hashes = (0..count)
+                .map(|value| format!("{value:064x}\n"))
+                .collect::<String>();
+            insert_hash_lines(db_path, Cursor::new(hashes))
         }
     }
 
@@ -833,14 +1033,13 @@ mod tests {
     }
 
     #[test]
-    fn insert_hash_lines_skips_comments_blanks_invalid_and_duplicates() {
+    fn insert_hash_lines_skips_comments_blanks_and_duplicates() {
         let file = tempfile::NamedTempFile::new().unwrap();
         create_database_tables(file.path()).unwrap();
 
         let data = b"
 # comment
 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
-invalid
 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 ";
@@ -859,6 +1058,16 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
             }
         );
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn insert_hash_lines_rejects_invalid_rows_without_partial_inserts() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+        let data = b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\ninvalid\n";
+
+        assert!(insert_hash_lines(file.path(), Cursor::new(data)).is_err());
+        assert_eq!(malware_hash_count(file.path()).unwrap(), 0);
     }
 
     #[test]
@@ -882,13 +1091,13 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
     fn insert_malware_bazaar_hashes_counts_valid_changed_rows() {
         let file = tempfile::NamedTempFile::new().unwrap();
         create_database_tables(file.path()).unwrap();
+        claim_malware_bazaar_request(file.path(), "recent", 1).unwrap();
         let samples = [
             sample(
                 "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
                 Some("family-a"),
                 Some("elf"),
             ),
-            sample("invalid", Some("ignored"), Some("ignored")),
             sample(
                 "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                 Some("family-b"),
@@ -932,6 +1141,7 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
     fn insert_malware_bazaar_hashes_updates_existing_rows() {
         let file = tempfile::NamedTempFile::new().unwrap();
         create_database_tables(file.path()).unwrap();
+        claim_malware_bazaar_request(file.path(), "recent", 1).unwrap();
         let hash = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
         assert_eq!(
@@ -1050,14 +1260,11 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
         )
         .unwrap();
         let client = FakeMalwareBazaarClient::new(
-            Ok(vec![
-                sample(
-                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-                    Some("family"),
-                    Some("elf"),
-                ),
-                sample("invalid", None, None),
-            ]),
+            Ok(vec![sample(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                Some("family"),
+                Some("elf"),
+            )]),
             Ok(99),
         );
 
@@ -1220,6 +1427,93 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
             err,
             UpdateSignaturesError::RecentFetch("recent failed".to_string())
         );
+    }
+
+    #[test]
+    fn failed_first_bootstrap_does_not_create_the_target_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("signatures.db");
+        let client = FakeMalwareBazaarClient::new(Ok(vec![]), Err("full failed"));
+
+        let err = update_signatures_with_client("auth", "selector", &path, &client).unwrap_err();
+
+        assert_eq!(
+            err,
+            UpdateSignaturesError::FullFetch("full failed".to_string())
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn invalid_existing_database_is_preserved_without_a_network_request() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"not sqlite").unwrap();
+        let client = FakeMalwareBazaarClient::new(Ok(vec![]), Ok(1));
+
+        let err =
+            update_signatures_with_client("auth", "selector", file.path(), &client).unwrap_err();
+
+        assert!(matches!(err, UpdateSignaturesError::DatabaseValidation(_)));
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"not sqlite");
+        assert_eq!(client.full_calls.get(), 0);
+        assert_eq!(client.recent_calls.get(), 0);
+    }
+
+    #[test]
+    fn invalid_recent_response_preserves_hashes_and_success_metadata() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        create_database_tables(file.path()).unwrap();
+        insert_hash_lines(
+            file.path(),
+            Cursor::new(b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n"),
+        )
+        .unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO update_metadata VALUES ('malware_bazaar', 1, 1, 'full', 10, 8)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let client = FakeMalwareBazaarClient::new(
+            Ok(vec![sample("invalid", Some("bad"), Some("bad"))]),
+            Ok(1),
+        );
+
+        let err =
+            update_signatures_with_client("auth", "selector", file.path(), &client).unwrap_err();
+
+        assert!(matches!(err, UpdateSignaturesError::InvalidResponse(_)));
+        assert_eq!(malware_hash_count(file.path()).unwrap(), 1);
+        let connection = Connection::open(file.path()).unwrap();
+        let metadata: (Option<i64>, String, i64, i64) = connection
+            .query_row(
+                "SELECT last_successful_update, last_mode, rows_seen, rows_inserted FROM update_metadata WHERE source = 'malware_bazaar'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(metadata, (Some(1), "full".to_string(), 10, 8));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn updater_rejects_database_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.db");
+        std::fs::write(&target, b"preserve me").unwrap();
+        let link = directory.path().join("signatures.db");
+        symlink(&target, &link).unwrap();
+        let client = FakeMalwareBazaarClient::new(Ok(vec![]), Ok(1));
+
+        let err = update_signatures_with_client("auth", "selector", &link, &client).unwrap_err();
+
+        assert!(matches!(err, UpdateSignaturesError::DatabaseValidation(_)));
+        assert_eq!(std::fs::read(target).unwrap(), b"preserve me");
+        assert_eq!(client.full_calls.get(), 0);
     }
 
     #[test]
