@@ -4,11 +4,14 @@ use super::heuristics::{
 use super::yara::{MatchedYaraRule, YaraRuleClass, score_matched_rule};
 use super::{
     database::HashDatabase,
-    hash::{FileHashes, hash_file_from_disk, hash_file_from_memory},
+    hash::{FileHashes, hash_file_from_memory, hash_file_from_reader},
 };
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::io::{Cursor, ErrorKind, Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 const MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE: u64 = 64 * 1024 * 1024;
@@ -355,15 +358,12 @@ pub fn scan_path(
     summary
 }
 
-/// Function to scan a single file by comparing it known hashes.
-fn scan_file_hashes_from_disk(
-    path: impl AsRef<Path>,
+/// Compare hashes read from an already-open file descriptor.
+fn scan_file_hashes(
+    file: &mut File,
     hash_database: &HashDatabase,
 ) -> Result<HashScanResult, ScanError> {
-    let hashes = match hash_file_from_disk(path) {
-        Err(_) => return Err(ScanError::HashComparisonFailed),
-        Ok(hashes) => hashes,
-    };
+    let hashes = hash_file_from_reader(file).map_err(|_| ScanError::HashComparisonFailed)?;
     compare_hashes(hashes, hash_database)
 }
 
@@ -416,6 +416,13 @@ fn scan_file_yara_from_disk(
     })
 }
 
+/// Scan the inode referenced by an already-open descriptor, independently of
+/// any subsequent replacement of its original pathname.
+fn scan_file_yara(file: &File, scanner: &mut yara_x::Scanner) -> Result<YaraScanResult, ScanError> {
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    scan_file_yara_from_disk(&descriptor_path, scanner)
+}
+
 /// Function to scan a single file in memory by running YARA rules against it.
 fn scan_file_yara_from_memory(
     buffer: &[u8],
@@ -442,13 +449,28 @@ fn scan_file_yara_from_memory(
     })
 }
 
-/// Check whether a filesystem file can be opened for reading.
-fn can_read_file(path: &Path) -> Result<bool, std::io::Error> {
-    match std::fs::File::open(path) {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => Ok(false),
-        Err(err) => Err(err),
-    }
+#[derive(Debug)]
+enum OpenScanFileError {
+    Symlink,
+    PermissionDenied,
+    Other(std::io::Error),
+}
+
+/// Open a path atomically and classify expected skip conditions.
+fn open_scan_file(path: &Path) -> Result<File, OpenScanFileError> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|err| {
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                OpenScanFileError::Symlink
+            } else if err.kind() == ErrorKind::PermissionDenied {
+                OpenScanFileError::PermissionDenied
+            } else {
+                OpenScanFileError::Other(err)
+            }
+        })
 }
 
 /// Function to scan a file and report the results by modifying the provided summary.
@@ -460,7 +482,25 @@ fn scan_one_and_report(
 ) {
     let mut heuristics = HeuristicAccumulator::new();
     let mut surface = DetectionSurface::FileSystemFile;
-    let metadata = match std::fs::symlink_metadata(path) {
+    let mut file = match open_scan_file(path) {
+        Ok(file) => file,
+        Err(OpenScanFileError::Symlink) => {
+            summary.record_skip(SkipReason::FileIsSymLink);
+            return;
+        }
+        Err(OpenScanFileError::PermissionDenied) => {
+            summary.record_skip(SkipReason::PermissionDenied);
+            eprintln!("Skipping {}: permission denied", path.display());
+            return;
+        }
+        Err(OpenScanFileError::Other(err)) => {
+            summary.errors += 1;
+            eprintln!("Could not open {} for scanning: {}", path.display(), err);
+            return;
+        }
+    };
+
+    let metadata = match file.metadata() {
         Ok(metadata) => metadata,
         Err(err) => {
             summary.errors += 1;
@@ -469,9 +509,9 @@ fn scan_one_and_report(
         }
     };
 
-    // Guard to skip symlinks
-    if metadata.file_type().is_symlink() {
-        summary.record_skip(SkipReason::FileIsSymLink);
+    if !metadata.is_file() {
+        summary.errors += 1;
+        eprintln!("Skipping non-file target: {:?}", path);
         return;
     }
 
@@ -481,26 +521,8 @@ fn scan_one_and_report(
         return;
     }
 
-    match can_read_file(path) {
-        Ok(true) => {}
-        Ok(false) => {
-            summary.record_skip(SkipReason::PermissionDenied);
-            eprintln!("Skipping {}: permission denied", path.display());
-            return;
-        }
-        Err(err) => {
-            summary.errors += 1;
-            eprintln!(
-                "Could not check read permission for {}: {}",
-                path.display(),
-                err
-            );
-            return;
-        }
-    }
-
     // Hash the file and compare
-    let hash_result = match scan_file_hashes_from_disk(path, hash_database) {
+    let hash_result = match scan_file_hashes(&mut file, hash_database) {
         Ok(result) => result,
         Err(err) => {
             summary.errors += 1;
@@ -523,15 +545,12 @@ fn scan_one_and_report(
 
     // Run heavier rules scan
     if metadata.len() > 32 {
-        // Check if we're attempting to scan an archive.
-        let mut file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(err) => {
-                summary.errors += 1;
-                eprintln!("Could not scan {}: {}", path.display(), err);
-                return;
-            }
-        };
+        // Hashing advanced the descriptor; archive probing starts at byte 0.
+        if let Err(err) = file.seek(SeekFrom::Start(0)) {
+            summary.errors += 1;
+            eprintln!("Could not rewind {} after hashing: {}", path.display(), err);
+            return;
+        }
 
         // ZIP needs 4 bytes.
         // GZIP needs 2 bytes.
@@ -578,18 +597,27 @@ fn scan_one_and_report(
             return;
         }
 
+        let archive_file = match file.try_clone() {
+            Ok(file) => file,
+            Err(err) => {
+                summary.errors += 1;
+                eprintln!("Could not retain {} for scanning: {}", path.display(), err);
+                return;
+            }
+        };
+
         if let Err(err) = match archive_kind {
             ArchiveKind::Unknown => Ok(()),
             ArchiveKind::Gzip => {
-                scan_gzip_reader(file, path, hash_database, yara_scanner, summary, 0)
+                scan_gzip_reader(archive_file, path, hash_database, yara_scanner, summary, 0)
             }
 
             ArchiveKind::Tar => {
-                scan_tar_archive(file, path, hash_database, yara_scanner, summary, 0)
+                scan_tar_archive(archive_file, path, hash_database, yara_scanner, summary, 0)
             }
 
             ArchiveKind::Zip => {
-                scan_zip_archive(file, path, hash_database, yara_scanner, summary, 0)
+                scan_zip_archive(archive_file, path, hash_database, yara_scanner, summary, 0)
             }
         } {
             summary.errors += 1;
@@ -597,7 +625,7 @@ fn scan_one_and_report(
         };
 
         // If it's not an archive, check the YARA rules.
-        let yara_result = match scan_file_yara_from_disk(path, yara_scanner) {
+        let yara_result = match scan_file_yara(&file, yara_scanner) {
             Ok(result) => result,
             Err(err) => {
                 summary.errors += 1;
@@ -1955,28 +1983,6 @@ mod tests {
     }
 
     #[test]
-    fn scan_file_hashes_from_disk_reports_missing_path_error() {
-        let database = HashDatabase::default();
-        let target = tempfile::tempdir().unwrap().path().join("missing.bin");
-
-        let err = scan_file_hashes_from_disk(&target, &database).unwrap_err();
-
-        assert_eq!(err, ScanError::HashComparisonFailed);
-        assert_eq!(err.to_string(), "Unable to compare hash");
-    }
-
-    #[test]
-    fn scan_file_hashes_from_disk_returns_clean_for_unknown_file() {
-        let database = HashDatabase::default();
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), b"unknown disk hash payload").unwrap();
-
-        let result = scan_file_hashes_from_disk(file.path(), &database).unwrap();
-
-        assert!(matches!(result, HashScanResult::Clean));
-    }
-
-    #[test]
     fn scan_file_hashes_from_memory_detects_known_hash() {
         let payload = b"known in-memory hash payload";
         let (_database_file, database) = hash_database_for_payload(payload);
@@ -1997,35 +2003,69 @@ mod tests {
     }
 
     #[test]
-    fn can_read_file_reports_existing_files_as_readable() {
+    fn open_scan_file_opens_existing_regular_file() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), b"readable").unwrap();
 
-        let readable = can_read_file(file.path()).unwrap();
+        let opened = open_scan_file(file.path()).unwrap();
 
-        assert!(readable);
+        assert!(opened.metadata().unwrap().is_file());
     }
 
     #[cfg(unix)]
     #[test]
-    fn can_read_file_reports_permission_denied_as_not_readable() {
+    fn open_scan_file_classifies_permission_denied() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), b"unreadable").unwrap();
         set_mode(file.path(), 0o000);
 
-        let readable = can_read_file(file.path()).unwrap();
+        let err = open_scan_file(file.path()).unwrap_err();
 
         set_mode(file.path(), 0o600);
-        assert!(!readable);
+        assert!(matches!(err, OpenScanFileError::PermissionDenied));
     }
 
     #[test]
-    fn can_read_file_reports_missing_paths_as_errors() {
+    fn open_scan_file_preserves_unexpected_errors() {
         let target = tempfile::tempdir().unwrap().path().join("missing.bin");
 
-        let err = can_read_file(&target).unwrap_err();
+        let err = open_scan_file(&target).unwrap_err();
 
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let OpenScanFileError::Other(err) = err else {
+            panic!("expected an unclassified I/O error");
+        };
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn open_scan_file_classifies_symbolic_links_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.bin");
+        let link = directory.path().join("link.bin");
+        std::fs::write(&target, b"target").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = open_scan_file(&link).unwrap_err();
+
+        assert!(matches!(err, OpenScanFileError::Symlink));
+    }
+
+    #[test]
+    fn opened_file_remains_pinned_when_path_is_replaced_by_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let scan_path = directory.path().join("scan.bin");
+        let original_path = directory.path().join("original.bin");
+        let replacement_path = directory.path().join("replacement.bin");
+        std::fs::write(&scan_path, b"original contents").unwrap();
+        std::fs::write(&replacement_path, b"replacement contents").unwrap();
+
+        let mut opened = open_scan_file(&scan_path).unwrap();
+        std::fs::rename(&scan_path, &original_path).unwrap();
+        symlink(&replacement_path, &scan_path).unwrap();
+
+        let mut contents = Vec::new();
+        opened.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"original contents");
     }
 
     #[test]
