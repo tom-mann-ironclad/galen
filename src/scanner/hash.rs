@@ -60,7 +60,7 @@ mod tests {
 
     impl Read for FailingReader {
         fn read(&mut self, _buffer: &mut [u8]) -> Result<usize, Error> {
-            Err(Error::new(ErrorKind::Other, "read failed"))
+            Err(Error::other("read failed"))
         }
     }
 
