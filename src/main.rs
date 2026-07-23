@@ -5,7 +5,6 @@ pub mod updater;
 
 use std::{
     io::{self, Write},
-    path::Path,
     time::Duration,
 };
 
@@ -504,13 +503,16 @@ where
     write!(output, "{}", help_text())
 }
 
-/// Helper function to determine if a path has any child detection records.
-fn has_child_detection(container: &Path, records: &[DetectionRecord]) -> bool {
-    let prefix = format!("{}!/", container.to_string_lossy());
+/// Determine whether an archive container has a child detection that preserves
+/// the container's verdict in the visible report.
+fn has_child_detection(container: &DetectionRecord, records: &[DetectionRecord]) -> bool {
+    let prefix = format!("{}!/", container.path.to_string_lossy());
 
-    records
-        .iter()
-        .any(|record| record.path.to_string_lossy().starts_with(&prefix))
+    records.iter().any(|record| {
+        record.surface != DetectionSurface::FileSystemFile
+            && record.verdict >= container.verdict
+            && record.path.to_string_lossy().starts_with(&prefix)
+    })
 }
 
 /// Function to determine which detection records should be displayed.
@@ -518,7 +520,7 @@ pub fn should_display_detection(record: &DetectionRecord, records: &[DetectionRe
     match record.surface {
         DetectionSurface::FileSystemFile => true,
         DetectionSurface::ArchiveEntry => true,
-        DetectionSurface::ArchiveContainer => !has_child_detection(&record.path, records),
+        DetectionSurface::ArchiveContainer => !has_child_detection(record, records),
     }
 }
 
@@ -528,7 +530,7 @@ mod tests {
     use crate::scanner::heuristics::{
         Confidence, Finding, FindingId, MAX_FINDINGS_PER_FILE, Verdict,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// Backend used in testing as a mock.
     struct FakeUpdateBackend {
@@ -1005,7 +1007,7 @@ Options:
     }
 
     #[test]
-    fn json_scan_report_returns_success_for_suppressed_container_without_visible_child() {
+    fn json_scan_report_keeps_malicious_container_visible_with_weaker_child() {
         let mut summary = ScanSummaryStats::new();
         summary.detections = vec![
             detection(
@@ -1026,8 +1028,12 @@ Options:
             write_json_scan_report(&summary, Duration::from_millis(1), &mut stdout, &mut stderr)
                 .unwrap();
 
-        assert_eq!(exit_code, EXIT_SUCCESS);
-        assert!(visible_human_detections(&summary).is_empty());
+        assert_eq!(exit_code, EXIT_DETECTIONS);
+        assert_eq!(visible_human_detections(&summary).len(), 1);
+        assert_eq!(
+            visible_human_detections(&summary)[0].path,
+            PathBuf::from("archive.zip")
+        );
         assert!(String::from_utf8(stderr).unwrap().is_empty());
     }
 
@@ -1420,5 +1426,41 @@ Options:
             child,
         ];
         assert!(!should_display_detection(&records[0], &records));
+    }
+
+    #[test]
+    fn weaker_child_detection_does_not_hide_malicious_archive_container() {
+        let records = [
+            detection(
+                "sample.zip",
+                DetectionSurface::ArchiveContainer,
+                Verdict::Malicious,
+            ),
+            detection(
+                "sample.zip!/payload.bin",
+                DetectionSurface::ArchiveEntry,
+                Verdict::Suspicious,
+            ),
+        ];
+
+        assert!(should_display_detection(&records[0], &records));
+    }
+
+    #[test]
+    fn filesystem_path_resembling_archive_child_does_not_hide_container() {
+        let records = [
+            detection(
+                "sample.zip",
+                DetectionSurface::ArchiveContainer,
+                Verdict::Malicious,
+            ),
+            detection(
+                "sample.zip!/payload.bin",
+                DetectionSurface::FileSystemFile,
+                Verdict::Malicious,
+            ),
+        ];
+
+        assert!(should_display_detection(&records[0], &records));
     }
 }
