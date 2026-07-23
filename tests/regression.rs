@@ -33,6 +33,32 @@ rule GALEN_Regression_EICAR_Archive_Test
     condition:
         $eicar
 }
+
+rule GALEN_Regression_EICAR_Weaker_Child
+{
+    meta:
+        description = "Regression rule for a suspicious archive child"
+        category = "test-file"
+
+    strings:
+        $marker = "GALEN_WEAKER_CHILD_MARKER" ascii
+
+    condition:
+        $marker
+}
+
+rule GALEN_Regression_EICAR_Container_Only
+{
+    meta:
+        description = "Regression rule stored only in the archive comment"
+        category = "test-file"
+
+    strings:
+        $marker = "GALEN_CONTAINER_ONLY_MARKER" ascii
+
+    condition:
+        $marker
+}
 "#;
 
 /// Runs the generated corpus regression suite through the compiled CLI.
@@ -201,6 +227,12 @@ fn run_smoke_regression(runner: &ScanRunner, corpus: &Path, manifest: &TomlValue
     assert_manifest_has_group(manifest, "archive-malicious");
     assert_manifest_has_group(manifest, "malformed");
     assert_manifest_has_case(manifest, "controlled-zip-bomb");
+    assert_manifest_has_case(
+        manifest,
+        "verdict-suppression-preserves-malicious-container",
+    );
+    assert_manifest_has_case(manifest, "symlink-no-follow");
+    assert_manifest_has_case(manifest, "zip-entry-count-preflight");
 
     assert_clean_scan(runner, &corpus.join("clean"), "clean smoke corpus");
     assert_malicious_scan(
@@ -225,6 +257,23 @@ fn run_smoke_regression(runner: &ScanRunner, corpus: &Path, manifest: &TomlValue
         &corpus.join("stress/decompression_limits/zip_bomb_controlled.zip"),
         "maximum_decompressed_size_reached",
         "controlled zip bomb",
+    );
+    assert_malicious_container_preserved(
+        runner,
+        &corpus
+            .join("security_regressions/verdict_suppression/malicious_container_weaker_child.zip"),
+        "verdict suppression regression",
+    );
+    assert_skip_scan(
+        runner,
+        &corpus.join("security_regressions/symlinks/malicious-link.bin"),
+        "file_is_symlink",
+        "symlink no-follow regression",
+    );
+    assert_zip_entry_preflight_skip(
+        runner,
+        &corpus.join("security_regressions/zip_limits/declared_10001_entries.zip"),
+        "ZIP entry-count preflight regression",
     );
 }
 
@@ -257,7 +306,7 @@ fn run_full_corpus_regression(runner: &ScanRunner, corpus: &Path, manifest: &Tom
                     assert_malformed_scan(runner, &file, id);
                 }
             }
-            "stress" => {}
+            "stress" | "security-regressions" => {}
             other => panic!("unhandled regression manifest group: {other}"),
         }
     }
@@ -276,6 +325,15 @@ fn run_full_corpus_regression(runner: &ScanRunner, corpus: &Path, manifest: &Tom
             }
             "controlled-zip-bomb" => {
                 assert_skip_scan(runner, &target, "maximum_decompressed_size_reached", id);
+            }
+            "verdict-suppression-preserves-malicious-container" => {
+                assert_malicious_container_preserved(runner, &target, id);
+            }
+            "symlink-no-follow" => {
+                assert_skip_scan(runner, &target, "file_is_symlink", id);
+            }
+            "zip-entry-count-preflight" => {
+                assert_zip_entry_preflight_skip(runner, &target, id);
             }
             other => panic!("unhandled regression manifest case: {other}"),
         }
@@ -427,6 +485,44 @@ fn assert_malicious_scan(runner: &ScanRunner, target: &Path, expect_inner_path: 
             result.stderr
         );
     }
+}
+
+/// Asserts that a weaker archive child cannot suppress its malicious container.
+fn assert_malicious_container_preserved(runner: &ScanRunner, target: &Path, label: &str) {
+    let result = runner.scan(target);
+    result.assert_status_ok(label);
+    assert_eq!(result.code, 1, "{label}: expected detection exit code");
+
+    let target_path = target.to_string_lossy();
+    assert!(
+        result.visible_detections().iter().any(|detection| {
+            detection["path"].as_str() == Some(target_path.as_ref())
+                && detection["verdict"].as_str() == Some("malicious")
+                && detection["surface"].as_str() == Some("archive_container")
+        }),
+        "{label}: malicious container was not visible\nstdout:\n{}\nstderr:\n{}",
+        result.stdout,
+        result.stderr
+    );
+}
+
+/// Asserts that an excessive ZIP footer count is rejected before any entries are parsed.
+fn assert_zip_entry_preflight_skip(runner: &ScanRunner, target: &Path, label: &str) {
+    let result = runner.scan(target);
+    result.assert_status_ok(label);
+    assert!(
+        result.has_skip_reason("maximum_archive_entries_reached"),
+        "{label}: expected maximum_archive_entries_reached skip\nstdout:\n{}\nstderr:\n{}",
+        result.stdout,
+        result.stderr
+    );
+    assert_eq!(
+        result.json["summary"]["archive_entries"].as_u64(),
+        Some(0),
+        "{label}: ZIP central directory entries were parsed before rejection\nstdout:\n{}\nstderr:\n{}",
+        result.stdout,
+        result.stderr
+    );
 }
 
 /// Asserts that a malformed fixture is handled without high-confidence detection.

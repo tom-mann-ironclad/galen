@@ -18,6 +18,9 @@ const MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE: u64 = 64 * 1024 * 1024;
 const RETAINED_ENTRY_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
 const MAX_ALLOWED_RECURSION: usize = 5;
 const MAX_ALLOWED_ARCHIVE_ENTRIES: usize = 10000;
+const ZIP_EOCD_MIN_SIZE: usize = 22;
+const ZIP_MAX_COMMENT_SIZE: usize = u16::MAX as usize;
+const ZIP64_EOCD_LOCATOR_SIZE: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScanError {
@@ -93,6 +96,27 @@ impl ArchiveScanState {
         self.entries_seen += 1;
 
         if self.entries_seen > MAX_ALLOWED_ARCHIVE_ENTRIES {
+            summary.record_skip(SkipReason::MaxArchiveEntries);
+            eprintln!(
+                "Skipped archive: maximum archive entries reached: {}",
+                archive_path.display()
+            );
+            return false;
+        }
+
+        true
+    }
+
+    /// Reject a ZIP before its central directory is parsed when the footer's
+    /// declared entry count cannot fit in the remaining per-tree budget.
+    fn allow_zip_entries(
+        &self,
+        entry_count: u64,
+        summary: &mut ScanSummaryStats,
+        archive_path: &Path,
+    ) -> bool {
+        let remaining = MAX_ALLOWED_ARCHIVE_ENTRIES.saturating_sub(self.entries_seen) as u64;
+        if entry_count > remaining {
             summary.record_skip(SkipReason::MaxArchiveEntries);
             eprintln!(
                 "Skipped archive: maximum archive entries reached: {}",
@@ -1051,6 +1075,68 @@ fn scan_bytes_with_state(
     Ok(())
 }
 
+/// Read the ZIP footer's declared entry count without parsing the central
+/// directory. `None` lets the ZIP parser report malformed footer details.
+fn zip_declared_entry_count<R>(reader: &mut R) -> Result<Option<u64>, std::io::Error>
+where
+    R: Read + Seek,
+{
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    let tail_len = file_len.min((ZIP_EOCD_MIN_SIZE + ZIP_MAX_COMMENT_SIZE) as u64) as usize;
+    if tail_len < ZIP_EOCD_MIN_SIZE {
+        return Ok(None);
+    }
+    reader.seek(SeekFrom::End(-(tail_len as i64)))?;
+
+    let mut tail = vec![0_u8; tail_len];
+    reader.read_exact(&mut tail)?;
+
+    let Some(eocd_offset) =
+        (0..=tail_len.saturating_sub(ZIP_EOCD_MIN_SIZE))
+            .rev()
+            .find(|&offset| {
+                tail[offset..].starts_with(b"PK\x05\x06")
+                    && offset
+                        + ZIP_EOCD_MIN_SIZE
+                        + u16::from_le_bytes([tail[offset + 20], tail[offset + 21]]) as usize
+                        == tail_len
+            })
+    else {
+        return Ok(None);
+    };
+
+    let entry_count = u16::from_le_bytes([tail[eocd_offset + 10], tail[eocd_offset + 11]]);
+    if entry_count != u16::MAX {
+        return Ok(Some(u64::from(entry_count)));
+    }
+
+    if eocd_offset < ZIP64_EOCD_LOCATOR_SIZE {
+        return Ok(None);
+    }
+    let locator_offset = eocd_offset - ZIP64_EOCD_LOCATOR_SIZE;
+    if !tail[locator_offset..].starts_with(b"PK\x06\x07") {
+        return Ok(None);
+    }
+
+    let zip64_offset = u64::from_le_bytes(
+        tail[locator_offset + 8..locator_offset + 16]
+            .try_into()
+            .expect("ZIP64 locator offset has fixed width"),
+    );
+    reader.seek(SeekFrom::Start(zip64_offset))?;
+    let mut zip64_eocd = [0_u8; 40];
+    reader.read_exact(&mut zip64_eocd)?;
+    if !zip64_eocd.starts_with(b"PK\x06\x06") {
+        return Ok(None);
+    }
+
+    Ok(Some(u64::from_le_bytes(
+        zip64_eocd[32..40]
+            .try_into()
+            .expect("ZIP64 entry count has fixed width"),
+    )))
+}
+
 /// Function to scan a zip archive.
 fn scan_zip_archive<R>(
     reader: R,
@@ -1075,7 +1161,7 @@ where
 }
 
 fn scan_zip_archive_with_state<R>(
-    reader: R,
+    mut reader: R,
     archive_path: &Path,
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
@@ -1090,6 +1176,14 @@ where
     }
 
     summary.archives_scanned += 1;
+
+    let declared_entries = zip_declared_entry_count(&mut reader)
+        .map_err(|err| ScanError::ZipOpenFailed(err.to_string()))?;
+    if let Some(entry_count) = declared_entries
+        && !archive_state.allow_zip_entries(entry_count, summary, archive_path)
+    {
+        return Ok(());
+    }
 
     let mut archive =
         zip::ZipArchive::new(reader).map_err(|err| ScanError::ZipOpenFailed(err.to_string()))?;
@@ -3081,7 +3175,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_zip_archive_limits_entries_across_one_archive_tree() {
+    fn scan_zip_archive_rejects_declared_count_over_tree_limit_before_parsing_entries() {
         let rules = non_matching_rules();
         let mut scanner = yara_x::Scanner::new(&rules);
         let database = HashDatabase::default();
@@ -3099,11 +3193,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.archive_entries_scanned, 0);
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 1);
+    }
+
+    #[test]
+    fn scan_zip_archive_accepts_declared_count_at_tree_limit() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let archive = zip_bytes_with_numbered_files(MAX_ALLOWED_ARCHIVE_ENTRIES);
+
+        scan_zip_archive(
+            std::io::Cursor::new(archive),
+            Path::new("at-limit.zip"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
         assert_eq!(
             summary.archive_entries_scanned,
             MAX_ALLOWED_ARCHIVE_ENTRIES as u64
         );
-        assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 1);
+        assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 0);
     }
 
     #[test]

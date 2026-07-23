@@ -18,6 +18,7 @@ require_cmd zip
 require_cmd mktemp
 require_cmd truncate
 require_cmd head
+require_cmd ln
 
 log "generating corpus at: $OUT_DIR"
 
@@ -38,6 +39,7 @@ EOF
 "$SCRIPT_DIR/generate-archives.sh" "$OUT_DIR"
 "$SCRIPT_DIR/generate-malformed.sh" "$OUT_DIR"
 "$SCRIPT_DIR/generate-stress.sh" "$OUT_DIR"
+"$SCRIPT_DIR/generate-security-regressions.sh" "$OUT_DIR"
 
 cat "$OUT_DIR"/.manifest.d/*.toml >> "$OUT_DIR/manifest.toml"
 rm -rf "$OUT_DIR/.manifest.d"
