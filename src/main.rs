@@ -11,8 +11,8 @@ use std::{
 use crate::scanner::{
     database::load_hash_database,
     heuristics::Verdict,
-    scan::scan_path,
     scan::{DetectionRecord, DetectionSurface, ScanSummaryStats, SkipReason},
+    scan::{ScanConfig, scan_path},
     yara::load_yara_rules_cache,
 };
 use crate::updater::{
@@ -30,8 +30,17 @@ const EXIT_SUCCESS: i32 = 0;
 const EXIT_DETECTIONS: i32 = 1;
 const EXIT_OPERATIONAL_ERROR: i32 = 2;
 const HASH_DATABASE_MAX_AGE_SECONDS: i64 = 7 * 24 * 60 * 60;
-const YARA_MAX_SCAN_SIZE: usize = 4 * 1024 * 1024;
-const YARA_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+const SCAN_CONFIG: ScanConfig = ScanConfig {
+    max_archive_depth: 5,
+    max_archive_entries: 10_000,
+    max_decompressed_file_size_bytes: 64 * 1024 * 1024,
+    max_file_size_bytes: 64 * 1024 * 1024,
+    zip_eocd_min_size_bytes: 22,
+    zip_max_comment_size_bytes: u16::MAX as usize,
+    zip64_eocd_locator_size_bytes: 20,
+    retained_entry_buffer_limit_bytes: 4 * 1024 * 1024,
+    yara_scan_timeout: Duration::from_secs(10),
+};
 
 #[cfg(not(tarpaulin))]
 fn main() {
@@ -114,12 +123,12 @@ where
     };
 
     let mut yara_scanner = yara_x::Scanner::new(&rules);
-    configure_yara_scanner(&mut yara_scanner);
+    configure_yara_scanner(&mut yara_scanner, SCAN_CONFIG);
     let _ = writeln!(stderr, "{:?} rules loaded", rules.iter().len());
 
     let _ = writeln!(stderr, "Starting scan...");
     let start_time = std::time::Instant::now();
-    let summary = scan_path(&args.target, &hash_database, &mut yara_scanner);
+    let summary = scan_path(&args.target, &hash_database, &mut yara_scanner, SCAN_CONFIG);
     let scan_time = start_time.elapsed();
 
     match args.output_format {
@@ -173,13 +182,14 @@ where
 }
 
 /// Apply the scanner limits used by the command-line scan path.
-fn configure_yara_scanner(scanner: &mut yara_x::Scanner) {
+fn configure_yara_scanner(scanner: &mut yara_x::Scanner, config: ScanConfig) {
+    let max_scan_size = usize::try_from(config.max_file_size_bytes).unwrap_or(usize::MAX);
     scanner
         .fast_scan(true)
         .max_matches_per_pattern(8)
-        .max_scan_size(YARA_MAX_SCAN_SIZE)
+        .max_scan_size(max_scan_size)
         .use_mmap(false)
-        .set_timeout(YARA_SCAN_TIMEOUT);
+        .set_timeout(config.yara_scan_timeout);
 }
 
 /// Write the human scan report to stdout and return the intended exit code.

@@ -13,15 +13,43 @@ use std::io::{Cursor, ErrorKind, Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
-const MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE: u64 = 64 * 1024 * 1024;
-const RETAINED_ENTRY_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
-const MAX_ALLOWED_RECURSION: usize = 5;
-const MAX_ALLOWED_ARCHIVE_ENTRIES: usize = 10000;
-const ZIP_EOCD_MIN_SIZE: usize = 22;
-const ZIP_MAX_COMMENT_SIZE: usize = u16::MAX as usize;
-const ZIP64_EOCD_LOCATOR_SIZE: usize = 20;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Resource limits applied while scanning files and archive trees.
+pub struct ScanConfig {
+    /// Maximum number of nested archive containers that may be opened.
+    pub max_archive_depth: usize,
+    /// Maximum cumulative number of entries inspected in one archive tree.
+    pub max_archive_entries: usize,
+    /// Maximum permitted size, in bytes, of a decompressed archive entry.
+    pub max_decompressed_file_size_bytes: u64,
+    /// Maximum permitted size, in bytes, of a filesystem file to scan.
+    pub max_file_size_bytes: u64,
+    /// Minimum size, in bytes, of a ZIP end-of-central-directory record.
+    pub zip_eocd_min_size_bytes: usize,
+    /// Maximum ZIP comment size, in bytes, included when searching for the EOCD record.
+    pub zip_max_comment_size_bytes: usize,
+    /// Size, in bytes, of a ZIP64 end-of-central-directory locator.
+    pub zip64_eocd_locator_size_bytes: usize,
+    /// Buffer capacity, in bytes, above which an archive-entry buffer is released.
+    pub retained_entry_buffer_limit_bytes: usize,
+    /// Maximum time allowed for each YARA scan operation.
+    pub yara_scan_timeout: Duration,
+}
 
+#[cfg(test)]
+const TEST_SCAN_CONFIG: ScanConfig = ScanConfig {
+    max_archive_depth: 5,
+    max_archive_entries: 10_000,
+    max_decompressed_file_size_bytes: 64 * 1024 * 1024,
+    max_file_size_bytes: 64 * 1024 * 1024,
+    zip_eocd_min_size_bytes: 22,
+    zip_max_comment_size_bytes: u16::MAX as usize,
+    zip64_eocd_locator_size_bytes: 20,
+    retained_entry_buffer_limit_bytes: 4 * 1024 * 1024,
+    yara_scan_timeout: Duration::from_secs(10),
+};
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScanError {
     HashComparisonFailed,
@@ -49,22 +77,29 @@ impl fmt::Display for ScanError {
 
 impl std::error::Error for ScanError {}
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 /// Tracks safety limits that must be shared while scanning one archive tree.
 struct ArchiveScanState {
     /// Cumulative member count for the current top-level archive scan.
     entries_seen: usize,
     /// Current nested archive depth for the active path being scanned.
     depth: usize,
+    config: ScanConfig,
 }
 
 impl ArchiveScanState {
     /// Start a fresh archive scan state at the caller's current depth.
-    fn new(depth: usize) -> Self {
+    fn new_with_config(depth: usize, config: ScanConfig) -> Self {
         Self {
             entries_seen: 0,
             depth,
+            config,
         }
+    }
+
+    #[cfg(test)]
+    fn new(depth: usize) -> Self {
+        Self::new_with_config(depth, TEST_SCAN_CONFIG)
     }
 
     /// Descend into an archive member that may itself contain an archive.
@@ -79,7 +114,7 @@ impl ArchiveScanState {
 
     /// Check whether another archive may be opened at the current path depth.
     fn allow_archive(&self, summary: &mut ScanSummaryStats, archive_path: &Path) -> bool {
-        if self.depth >= MAX_ALLOWED_RECURSION {
+        if self.depth >= self.config.max_archive_depth {
             summary.record_skip(SkipReason::MaxArchiveDepth);
             eprintln!(
                 "Skipped archive: maximum recursion reached: {}",
@@ -95,7 +130,7 @@ impl ArchiveScanState {
     fn record_entry(&mut self, summary: &mut ScanSummaryStats, archive_path: &Path) -> bool {
         self.entries_seen += 1;
 
-        if self.entries_seen > MAX_ALLOWED_ARCHIVE_ENTRIES {
+        if self.entries_seen > self.config.max_archive_entries {
             summary.record_skip(SkipReason::MaxArchiveEntries);
             eprintln!(
                 "Skipped archive: maximum archive entries reached: {}",
@@ -115,7 +150,10 @@ impl ArchiveScanState {
         summary: &mut ScanSummaryStats,
         archive_path: &Path,
     ) -> bool {
-        let remaining = MAX_ALLOWED_ARCHIVE_ENTRIES.saturating_sub(self.entries_seen) as u64;
+        let remaining = self
+            .config
+            .max_archive_entries
+            .saturating_sub(self.entries_seen) as u64;
         if entry_count > remaining {
             summary.record_skip(SkipReason::MaxArchiveEntries);
             eprintln!(
@@ -181,10 +219,11 @@ pub enum SkipReason {
     EncryptedFile,
     FileIsSymLink,
     PermissionDenied,
+    MaxFileSize,
 }
 
 impl SkipReason {
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 12;
 
     pub fn as_index(self) -> usize {
         match self {
@@ -199,6 +238,7 @@ impl SkipReason {
             SkipReason::EncryptedFile => 8,
             SkipReason::FileIsSymLink => 9,
             SkipReason::PermissionDenied => 10,
+            SkipReason::MaxFileSize => 11,
         }
     }
 
@@ -215,6 +255,7 @@ impl SkipReason {
             SkipReason::EncryptedFile => "file encrypted",
             SkipReason::FileIsSymLink => "file is symlink",
             SkipReason::PermissionDenied => "permission denied",
+            SkipReason::MaxFileSize => "maximum file size reached",
         }
     }
 
@@ -231,6 +272,7 @@ impl SkipReason {
             SkipReason::EncryptedFile => "file_encrypted",
             SkipReason::FileIsSymLink => "file_is_symlink",
             SkipReason::PermissionDenied => "permission_denied",
+            SkipReason::MaxFileSize => "maximum_file_size_reached",
         }
     }
 
@@ -246,6 +288,7 @@ impl SkipReason {
         SkipReason::EncryptedFile,
         SkipReason::FileIsSymLink,
         SkipReason::PermissionDenied,
+        SkipReason::MaxFileSize,
     ];
 }
 
@@ -356,6 +399,7 @@ pub fn scan_path(
     path: &Path,
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
+    config: ScanConfig,
 ) -> ScanSummaryStats {
     let mut summary = ScanSummaryStats::new();
     let metadata = match std::fs::symlink_metadata(path) {
@@ -369,9 +413,9 @@ pub fn scan_path(
     let file_type = metadata.file_type();
 
     if file_type.is_file() {
-        scan_one_and_report(path, hash_database, yara_scanner, &mut summary);
+        scan_one_and_report(path, hash_database, yara_scanner, &mut summary, config);
     } else if file_type.is_dir() {
-        scan_directory(path, hash_database, yara_scanner, &mut summary);
+        scan_directory(path, hash_database, yara_scanner, &mut summary, config);
     } else if file_type.is_symlink() {
         summary.record_skip(SkipReason::FileIsSymLink);
     } else {
@@ -503,6 +547,7 @@ fn scan_one_and_report(
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
+    config: ScanConfig,
 ) {
     let mut heuristics = HeuristicAccumulator::new();
     let mut surface = DetectionSurface::FileSystemFile;
@@ -542,6 +587,11 @@ fn scan_one_and_report(
     // Guard to avoid scanning 0-length files
     if metadata.len() == 0 {
         summary.record_skip(SkipReason::ZeroSize);
+        return;
+    }
+
+    if metadata.len() > config.max_file_size_bytes {
+        summary.record_skip(SkipReason::MaxFileSize);
         return;
     }
 
@@ -632,17 +682,35 @@ fn scan_one_and_report(
 
         if let Err(err) = match archive_kind {
             ArchiveKind::Unknown => Ok(()),
-            ArchiveKind::Gzip => {
-                scan_gzip_reader(archive_file, path, hash_database, yara_scanner, summary, 0)
-            }
+            ArchiveKind::Gzip => scan_gzip_reader_with_config(
+                archive_file,
+                path,
+                hash_database,
+                yara_scanner,
+                summary,
+                0,
+                config,
+            ),
 
-            ArchiveKind::Tar => {
-                scan_tar_archive(archive_file, path, hash_database, yara_scanner, summary, 0)
-            }
+            ArchiveKind::Tar => scan_tar_archive_with_config(
+                archive_file,
+                path,
+                hash_database,
+                yara_scanner,
+                summary,
+                0,
+                config,
+            ),
 
-            ArchiveKind::Zip => {
-                scan_zip_archive(archive_file, path, hash_database, yara_scanner, summary, 0)
-            }
+            ArchiveKind::Zip => scan_zip_archive_with_config(
+                archive_file,
+                path,
+                hash_database,
+                yara_scanner,
+                summary,
+                0,
+                config,
+            ),
         } {
             summary.errors += 1;
             eprintln!("Could not scan archive {}: {}", path.display(), err);
@@ -704,6 +772,7 @@ fn scan_directory(
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
+    config: ScanConfig,
 ) {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -729,6 +798,7 @@ fn scan_directory(
         hash_database,
         yara_scanner,
         summary,
+        config,
     );
 }
 
@@ -739,6 +809,7 @@ fn scan_directory_entry_paths<I>(
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
+    config: ScanConfig,
 ) where
     I: IntoIterator<Item = Result<PathBuf, std::io::Error>>,
 {
@@ -780,9 +851,9 @@ fn scan_directory_entry_paths<I>(
         let file_type = metadata.file_type();
 
         if file_type.is_dir() {
-            scan_directory(&path, hash_database, yara_scanner, summary);
+            scan_directory(&path, hash_database, yara_scanner, summary, config);
         } else if file_type.is_file() {
-            scan_one_and_report(&path, hash_database, yara_scanner, summary);
+            scan_one_and_report(&path, hash_database, yara_scanner, summary, config);
         } else if file_type.is_symlink() {
             summary.record_skip(SkipReason::FileIsSymLink);
             eprintln!("Skipping {:?} because it is a symlink", path);
@@ -1077,13 +1148,20 @@ fn scan_bytes_with_state(
 
 /// Read the ZIP footer's declared entry count without parsing the central
 /// directory. `None` lets the ZIP parser report malformed footer details.
-fn zip_declared_entry_count<R>(reader: &mut R) -> Result<Option<u64>, std::io::Error>
+fn zip_declared_entry_count<R>(
+    reader: &mut R,
+    config: ScanConfig,
+) -> Result<Option<u64>, std::io::Error>
 where
     R: Read + Seek,
 {
     let file_len = reader.seek(SeekFrom::End(0))?;
-    let tail_len = file_len.min((ZIP_EOCD_MIN_SIZE + ZIP_MAX_COMMENT_SIZE) as u64) as usize;
-    if tail_len < ZIP_EOCD_MIN_SIZE {
+    let tail_len = file_len.min(
+        config
+            .zip_eocd_min_size_bytes
+            .saturating_add(config.zip_max_comment_size_bytes) as u64,
+    ) as usize;
+    if tail_len < config.zip_eocd_min_size_bytes {
         return Ok(None);
     }
     reader.seek(SeekFrom::End(-(tail_len as i64)))?;
@@ -1091,16 +1169,15 @@ where
     let mut tail = vec![0_u8; tail_len];
     reader.read_exact(&mut tail)?;
 
-    let Some(eocd_offset) =
-        (0..=tail_len.saturating_sub(ZIP_EOCD_MIN_SIZE))
-            .rev()
-            .find(|&offset| {
-                tail[offset..].starts_with(b"PK\x05\x06")
-                    && offset
-                        + ZIP_EOCD_MIN_SIZE
-                        + u16::from_le_bytes([tail[offset + 20], tail[offset + 21]]) as usize
-                        == tail_len
-            })
+    let Some(eocd_offset) = (0..=tail_len.saturating_sub(config.zip_eocd_min_size_bytes))
+        .rev()
+        .find(|&offset| {
+            tail[offset..].starts_with(b"PK\x05\x06")
+                && offset
+                    + config.zip_eocd_min_size_bytes
+                    + u16::from_le_bytes([tail[offset + 20], tail[offset + 21]]) as usize
+                    == tail_len
+        })
     else {
         return Ok(None);
     };
@@ -1110,10 +1187,10 @@ where
         return Ok(Some(u64::from(entry_count)));
     }
 
-    if eocd_offset < ZIP64_EOCD_LOCATOR_SIZE {
+    if eocd_offset < config.zip64_eocd_locator_size_bytes {
         return Ok(None);
     }
-    let locator_offset = eocd_offset - ZIP64_EOCD_LOCATOR_SIZE;
+    let locator_offset = eocd_offset - config.zip64_eocd_locator_size_bytes;
     if !tail[locator_offset..].starts_with(b"PK\x06\x07") {
         return Ok(None);
     }
@@ -1138,18 +1215,19 @@ where
 }
 
 /// Function to scan a zip archive.
-fn scan_zip_archive<R>(
+fn scan_zip_archive_with_config<R>(
     reader: R,
     archive_path: &Path,
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
     depth: usize,
+    config: ScanConfig,
 ) -> Result<(), ScanError>
 where
     R: Read + std::io::Seek,
 {
-    let mut archive_state = ArchiveScanState::new(depth);
+    let mut archive_state = ArchiveScanState::new_with_config(depth, config);
     scan_zip_archive_with_state(
         reader,
         archive_path,
@@ -1177,7 +1255,7 @@ where
 
     summary.archives_scanned += 1;
 
-    let declared_entries = zip_declared_entry_count(&mut reader)
+    let declared_entries = zip_declared_entry_count(&mut reader, archive_state.config)
         .map_err(|err| ScanError::ZipOpenFailed(err.to_string()))?;
     if let Some(entry_count) = declared_entries
         && !archive_state.allow_zip_entries(entry_count, summary, archive_path)
@@ -1218,7 +1296,7 @@ where
 
         let entry_size = entry.size();
 
-        if entry_size > MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE {
+        if entry_size > archive_state.config.max_decompressed_file_size_bytes {
             summary.record_skip(SkipReason::MaxDecompressedBytes);
             continue;
         }
@@ -1228,7 +1306,7 @@ where
         if let Err(err) = read_limited_into(
             &mut entry,
             &mut entry_buffer,
-            MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE,
+            archive_state.config.max_decompressed_file_size_bytes,
         ) {
             summary.record_skip(SkipReason::MaxDecompressedBytes);
             eprintln!(
@@ -1253,7 +1331,7 @@ where
         );
         archive_state.leave_child();
 
-        if entry_buffer.capacity() > RETAINED_ENTRY_BUFFER_LIMIT {
+        if entry_buffer.capacity() > archive_state.config.retained_entry_buffer_limit_bytes {
             entry_buffer = Vec::new();
         } else {
             entry_buffer.clear();
@@ -1264,18 +1342,19 @@ where
 }
 
 /// Function to scan a tar archive.
-fn scan_tar_archive<R>(
+fn scan_tar_archive_with_config<R>(
     reader: R,
     archive_path: &Path,
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
     depth: usize,
+    config: ScanConfig,
 ) -> Result<(), ScanError>
 where
     R: Read,
 {
-    let mut archive_state = ArchiveScanState::new(depth);
+    let mut archive_state = ArchiveScanState::new_with_config(depth, config);
     scan_tar_archive_with_state(
         reader,
         archive_path,
@@ -1347,7 +1426,7 @@ where
 
         let entry_size = header.size().unwrap_or(0);
 
-        if entry_size > MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE {
+        if entry_size > archive_state.config.max_decompressed_file_size_bytes {
             summary.record_skip(SkipReason::MaxDecompressedBytes);
             continue;
         }
@@ -1368,7 +1447,7 @@ where
         if let Err(err) = read_limited_into(
             &mut entry,
             &mut entry_buffer,
-            MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE,
+            archive_state.config.max_decompressed_file_size_bytes,
         ) {
             summary.record_skip(SkipReason::MaxDecompressedBytes);
             eprintln!(
@@ -1393,7 +1472,7 @@ where
         );
         archive_state.leave_child();
 
-        if entry_buffer.capacity() > RETAINED_ENTRY_BUFFER_LIMIT {
+        if entry_buffer.capacity() > archive_state.config.retained_entry_buffer_limit_bytes {
             entry_buffer = Vec::new();
         } else {
             entry_buffer.clear();
@@ -1404,18 +1483,19 @@ where
 }
 
 /// Function to read gzip compressed files.
-fn scan_gzip_reader<R>(
+fn scan_gzip_reader_with_config<R>(
     reader: R,
     archive_path: &Path,
     hash_database: &HashDatabase,
     yara_scanner: &mut yara_x::Scanner,
     summary: &mut ScanSummaryStats,
     depth: usize,
+    config: ScanConfig,
 ) -> Result<(), ScanError>
 where
     R: Read,
 {
-    let mut archive_state = ArchiveScanState::new(depth);
+    let mut archive_state = ArchiveScanState::new_with_config(depth, config);
     scan_gzip_reader_with_state(
         reader,
         archive_path,
@@ -1443,7 +1523,10 @@ where
 
     summary.archives_scanned += 1;
 
-    let decompressed = match decompress_gzip_limited(reader, MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE) {
+    let decompressed = match decompress_gzip_limited(
+        reader,
+        archive_state.config.max_decompressed_file_size_bytes,
+    ) {
         Ok(bytes) => bytes,
         Err(ScanError::GzipDecompressedSizeLimitExceeded) => {
             summary.record_skip(SkipReason::MaxDecompressedBytes);
@@ -1548,6 +1631,108 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
+
+    fn scan_path(
+        path: &Path,
+        database: &HashDatabase,
+        scanner: &mut yara_x::Scanner,
+    ) -> ScanSummaryStats {
+        super::scan_path(path, database, scanner, TEST_SCAN_CONFIG)
+    }
+
+    fn scan_one_and_report(
+        path: &Path,
+        database: &HashDatabase,
+        scanner: &mut yara_x::Scanner,
+        summary: &mut ScanSummaryStats,
+    ) {
+        super::scan_one_and_report(path, database, scanner, summary, TEST_SCAN_CONFIG)
+    }
+
+    fn scan_directory(
+        path: &Path,
+        database: &HashDatabase,
+        scanner: &mut yara_x::Scanner,
+        summary: &mut ScanSummaryStats,
+    ) {
+        super::scan_directory(path, database, scanner, summary, TEST_SCAN_CONFIG)
+    }
+
+    fn scan_directory_entry_paths<I>(
+        directory: &Path,
+        entries: I,
+        database: &HashDatabase,
+        scanner: &mut yara_x::Scanner,
+        summary: &mut ScanSummaryStats,
+    ) where
+        I: IntoIterator<Item = Result<PathBuf, std::io::Error>>,
+    {
+        super::scan_directory_entry_paths(
+            directory,
+            entries,
+            database,
+            scanner,
+            summary,
+            TEST_SCAN_CONFIG,
+        )
+    }
+
+    fn scan_zip_archive<R: Read + Seek>(
+        reader: R,
+        path: &Path,
+        database: &HashDatabase,
+        scanner: &mut yara_x::Scanner,
+        summary: &mut ScanSummaryStats,
+        depth: usize,
+    ) -> Result<(), ScanError> {
+        super::scan_zip_archive_with_config(
+            reader,
+            path,
+            database,
+            scanner,
+            summary,
+            depth,
+            TEST_SCAN_CONFIG,
+        )
+    }
+
+    fn scan_tar_archive<R: Read>(
+        reader: R,
+        path: &Path,
+        database: &HashDatabase,
+        scanner: &mut yara_x::Scanner,
+        summary: &mut ScanSummaryStats,
+        depth: usize,
+    ) -> Result<(), ScanError> {
+        super::scan_tar_archive_with_config(
+            reader,
+            path,
+            database,
+            scanner,
+            summary,
+            depth,
+            TEST_SCAN_CONFIG,
+        )
+    }
+
+    fn scan_gzip_reader<R: Read>(
+        reader: R,
+        path: &Path,
+        database: &HashDatabase,
+        scanner: &mut yara_x::Scanner,
+        summary: &mut ScanSummaryStats,
+        depth: usize,
+    ) -> Result<(), ScanError> {
+        super::scan_gzip_reader_with_config(
+            reader,
+            path,
+            database,
+            scanner,
+            summary,
+            depth,
+            TEST_SCAN_CONFIG,
+        )
+    }
 
     fn compile_rules(source: &str) -> yara_x::Rules {
         let mut compiler = yara_x::Compiler::new();
@@ -2058,7 +2243,7 @@ mod tests {
     fn archive_scan_state_tracks_depth_and_entry_limits() {
         let mut summary = ScanSummaryStats::new();
         let archive_path = Path::new("archive.zip");
-        let mut state = ArchiveScanState::new(MAX_ALLOWED_RECURSION - 1);
+        let mut state = ArchiveScanState::new(TEST_SCAN_CONFIG.max_archive_depth - 1);
 
         assert!(state.allow_archive(&mut summary, archive_path));
         state.enter_child();
@@ -2067,7 +2252,7 @@ mod tests {
         assert!(state.allow_archive(&mut summary, archive_path));
         assert_eq!(summary.skip_count(SkipReason::MaxArchiveDepth), 1);
 
-        state.entries_seen = MAX_ALLOWED_ARCHIVE_ENTRIES;
+        state.entries_seen = TEST_SCAN_CONFIG.max_archive_entries;
         assert!(!state.record_entry(&mut summary, archive_path));
         assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 1);
 
@@ -2286,6 +2471,24 @@ mod tests {
         assert_eq!(summary.skip_count(SkipReason::ZeroSize), 1);
         assert_eq!(summary.filesystem_files_scanned, 0);
         assert!(summary.detections.is_empty());
+    }
+
+    #[test]
+    fn scan_path_applies_configured_max_file_size() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"too large").unwrap();
+        let config = ScanConfig {
+            max_file_size_bytes: 4,
+            ..TEST_SCAN_CONFIG
+        };
+
+        let summary = super::scan_path(file.path(), &database, &mut scanner, config);
+
+        assert_eq!(summary.skip_count(SkipReason::MaxFileSize), 1);
+        assert_eq!(summary.filesystem_files_scanned, 0);
     }
 
     #[test]
@@ -3045,7 +3248,7 @@ mod tests {
             &database,
             &mut scanner,
             &mut summary,
-            MAX_ALLOWED_RECURSION,
+            TEST_SCAN_CONFIG.max_archive_depth,
         )
         .unwrap();
 
@@ -3068,7 +3271,7 @@ mod tests {
             &database,
             &mut scanner,
             &mut summary,
-            MAX_ALLOWED_RECURSION - 1,
+            TEST_SCAN_CONFIG.max_archive_depth - 1,
         )
         .unwrap();
 
@@ -3124,7 +3327,7 @@ mod tests {
             &database,
             &mut scanner,
             &mut summary,
-            MAX_ALLOWED_RECURSION,
+            TEST_SCAN_CONFIG.max_archive_depth,
         )
         .unwrap();
 
@@ -3139,7 +3342,10 @@ mod tests {
         let mut scanner = yara_x::Scanner::new(&rules);
         let database = HashDatabase::default();
         let mut summary = ScanSummaryStats::new();
-        let archive = zip_bytes_with_zero_file("limit.bin", MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE);
+        let archive = zip_bytes_with_zero_file(
+            "limit.bin",
+            TEST_SCAN_CONFIG.max_decompressed_file_size_bytes,
+        );
 
         scan_zip_archive(
             std::io::Cursor::new(archive),
@@ -3155,8 +3361,10 @@ mod tests {
         assert_eq!(summary.archive_entries_scanned, 1);
         assert_eq!(summary.skip_count(SkipReason::MaxDecompressedBytes), 0);
 
-        let archive =
-            zip_bytes_with_zero_file("oversized.bin", MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE + 1);
+        let archive = zip_bytes_with_zero_file(
+            "oversized.bin",
+            TEST_SCAN_CONFIG.max_decompressed_file_size_bytes + 1,
+        );
         let mut summary = ScanSummaryStats::new();
 
         scan_zip_archive(
@@ -3180,7 +3388,7 @@ mod tests {
         let mut scanner = yara_x::Scanner::new(&rules);
         let database = HashDatabase::default();
         let mut summary = ScanSummaryStats::new();
-        let archive = zip_bytes_with_numbered_files(MAX_ALLOWED_ARCHIVE_ENTRIES + 1);
+        let archive = zip_bytes_with_numbered_files(TEST_SCAN_CONFIG.max_archive_entries + 1);
 
         scan_zip_archive(
             std::io::Cursor::new(archive),
@@ -3203,7 +3411,7 @@ mod tests {
         let mut scanner = yara_x::Scanner::new(&rules);
         let database = HashDatabase::default();
         let mut summary = ScanSummaryStats::new();
-        let archive = zip_bytes_with_numbered_files(MAX_ALLOWED_ARCHIVE_ENTRIES);
+        let archive = zip_bytes_with_numbered_files(TEST_SCAN_CONFIG.max_archive_entries);
 
         scan_zip_archive(
             std::io::Cursor::new(archive),
@@ -3218,7 +3426,7 @@ mod tests {
         assert_eq!(summary.archives_scanned, 1);
         assert_eq!(
             summary.archive_entries_scanned,
-            MAX_ALLOWED_ARCHIVE_ENTRIES as u64
+            TEST_SCAN_CONFIG.max_archive_entries as u64
         );
         assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 0);
     }
@@ -3229,7 +3437,7 @@ mod tests {
         let mut scanner = yara_x::Scanner::new(&rules);
         let database = HashDatabase::default();
         let mut summary = ScanSummaryStats::new();
-        let archive = zip_bytes_with_numbered_files(MAX_ALLOWED_ARCHIVE_ENTRIES);
+        let archive = zip_bytes_with_numbered_files(TEST_SCAN_CONFIG.max_archive_entries);
 
         scan_zip_archive(
             std::io::Cursor::new(archive.clone()),
@@ -3253,7 +3461,7 @@ mod tests {
         assert_eq!(summary.archives_scanned, 2);
         assert_eq!(
             summary.archive_entries_scanned,
-            (MAX_ALLOWED_ARCHIVE_ENTRIES * 2) as u64
+            (TEST_SCAN_CONFIG.max_archive_entries * 2) as u64
         );
         assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 0);
     }
@@ -3265,8 +3473,10 @@ mod tests {
         let database = HashDatabase::default();
         let mut summary = ScanSummaryStats::new();
         let nested = zip_bytes_with_numbered_files(1);
-        let archive =
-            zip_bytes_with_padding_and_nested_zip(MAX_ALLOWED_ARCHIVE_ENTRIES - 1, &nested);
+        let archive = zip_bytes_with_padding_and_nested_zip(
+            TEST_SCAN_CONFIG.max_archive_entries - 1,
+            &nested,
+        );
 
         scan_zip_archive(
             std::io::Cursor::new(archive),
@@ -3281,7 +3491,7 @@ mod tests {
         assert_eq!(summary.archives_scanned, 2);
         assert_eq!(
             summary.archive_entries_scanned,
-            MAX_ALLOWED_ARCHIVE_ENTRIES as u64
+            TEST_SCAN_CONFIG.max_archive_entries as u64
         );
         assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 1);
     }
@@ -3302,7 +3512,7 @@ mod tests {
             &database,
             &mut scanner,
             &mut summary,
-            MAX_ALLOWED_RECURSION - 1,
+            TEST_SCAN_CONFIG.max_archive_depth - 1,
         )
         .unwrap();
 
@@ -3386,8 +3596,10 @@ mod tests {
         let mut scanner = yara_x::Scanner::new(&rules);
         let database = HashDatabase::default();
         let mut summary = ScanSummaryStats::new();
-        let archive =
-            tar_header_declaring_size("oversized.bin", MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE + 1);
+        let archive = tar_header_declaring_size(
+            "oversized.bin",
+            TEST_SCAN_CONFIG.max_decompressed_file_size_bytes + 1,
+        );
 
         scan_tar_archive(
             std::io::Cursor::new(archive),
@@ -3411,7 +3623,10 @@ mod tests {
         let mut scanner = yara_x::Scanner::new(&rules);
         let database = HashDatabase::default();
         let mut summary = ScanSummaryStats::new();
-        let archive = tar_header_declaring_size("limit.bin", MAX_ALLOWED_UNCOMPRESSED_FILE_SIZE);
+        let archive = tar_header_declaring_size(
+            "limit.bin",
+            TEST_SCAN_CONFIG.max_decompressed_file_size_bytes,
+        );
 
         scan_tar_archive(
             std::io::Cursor::new(archive),
@@ -3434,7 +3649,7 @@ mod tests {
         let mut scanner = yara_x::Scanner::new(&rules);
         let database = HashDatabase::default();
         let mut summary = ScanSummaryStats::new();
-        let archive = tar_bytes_with_numbered_files(MAX_ALLOWED_ARCHIVE_ENTRIES + 1);
+        let archive = tar_bytes_with_numbered_files(TEST_SCAN_CONFIG.max_archive_entries + 1);
 
         scan_tar_archive(
             std::io::Cursor::new(archive),
@@ -3449,7 +3664,7 @@ mod tests {
         assert_eq!(summary.archives_scanned, 1);
         assert_eq!(
             summary.archive_entries_scanned,
-            MAX_ALLOWED_ARCHIVE_ENTRIES as u64
+            TEST_SCAN_CONFIG.max_archive_entries as u64
         );
         assert_eq!(summary.skip_count(SkipReason::MaxArchiveEntries), 1);
     }
@@ -3470,7 +3685,7 @@ mod tests {
             &database,
             &mut scanner,
             &mut summary,
-            MAX_ALLOWED_RECURSION - 1,
+            TEST_SCAN_CONFIG.max_archive_depth - 1,
         )
         .unwrap();
 
@@ -3492,7 +3707,7 @@ mod tests {
             &database,
             &mut scanner,
             &mut summary,
-            MAX_ALLOWED_RECURSION,
+            TEST_SCAN_CONFIG.max_archive_depth,
         )
         .unwrap();
 
