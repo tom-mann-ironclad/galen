@@ -30,18 +30,6 @@ const EXIT_SUCCESS: i32 = 0;
 const EXIT_DETECTIONS: i32 = 1;
 const EXIT_OPERATIONAL_ERROR: i32 = 2;
 const HASH_DATABASE_MAX_AGE_SECONDS: i64 = 7 * 24 * 60 * 60;
-const SCAN_CONFIG: ScanConfig = ScanConfig {
-    max_archive_depth: 5,
-    max_archive_entries: 10_000,
-    max_decompressed_file_size_bytes: 64 * 1024 * 1024,
-    max_file_size_bytes: 64 * 1024 * 1024,
-    zip_eocd_min_size_bytes: 22,
-    zip_max_comment_size_bytes: u16::MAX as usize,
-    zip64_eocd_locator_size_bytes: 20,
-    retained_entry_buffer_limit_bytes: 4 * 1024 * 1024,
-    yara_scan_timeout: Duration::from_secs(10),
-};
-
 #[cfg(not(tarpaulin))]
 fn main() {
     let exit_code = run_cli(std::env::args(), &mut io::stdout(), &mut io::stderr());
@@ -123,12 +111,17 @@ where
     };
 
     let mut yara_scanner = yara_x::Scanner::new(&rules);
-    configure_yara_scanner(&mut yara_scanner, SCAN_CONFIG);
+    configure_yara_scanner(&mut yara_scanner, args.scan_config);
     let _ = writeln!(stderr, "{:?} rules loaded", rules.iter().len());
 
     let _ = writeln!(stderr, "Starting scan...");
     let start_time = std::time::Instant::now();
-    let summary = scan_path(&args.target, &hash_database, &mut yara_scanner, SCAN_CONFIG);
+    let summary = scan_path(
+        &args.target,
+        &hash_database,
+        &mut yara_scanner,
+        args.scan_config,
+    );
     let scan_time = start_time.elapsed();
 
     match args.output_format {
@@ -488,7 +481,7 @@ where
 fn help_text() -> &'static str {
     "\
 Usage:
-  galen scan <target> [--database <path>] [--yara-cache <path>] [--output <format>]
+  galen scan <target> [options]
   galen update [--database <path>] [--yara-dir <path>] [--yara-cache <path>]
   galen --help
 
@@ -501,6 +494,18 @@ Options:
       --yara-dir <path>   Path to source YARA rules directory
   -y, --yara-cache <path> Path to compiled YARA rules cache
   -o, --output            The output format for scan results: human (default) or json  
+      --max-archive-depth <count>
+                           Maximum nested archive depth (default: 5)
+      --max-archive-entries <count>
+                           Maximum entries per archive tree (default: 10,000)
+      --max-decompressed-file-size-bytes <bytes>
+                           Maximum decompressed entry size (default: 64 MiB)
+      --max-file-size-bytes <bytes>
+                           Maximum filesystem file size (default: 64 MiB)
+      --retained-entry-buffer-limit-bytes <bytes>
+                           Retained archive buffer limit (default: 4 MiB)
+      --yara-scan-timeout-seconds <seconds>
+                           YARA scan timeout (default: 10 seconds)
   -h, --help              Show this help text
 "
 }
@@ -590,12 +595,42 @@ mod tests {
         rules.serialize_into(writer).unwrap();
     }
 
+    #[test]
+    fn configure_yara_scanner_applies_configured_max_file_size() {
+        let mut compiler = yara_x::Compiler::new();
+        compiler
+            .add_source(
+                r#"
+                rule test {
+                    strings:
+                        $marker = "5"
+                    condition:
+                        $marker
+                }
+                "#,
+            )
+            .unwrap();
+        let rules = compiler.build();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let config = ScanConfig {
+            max_file_size_bytes: 4,
+            ..crate::cli::DEFAULT_SCAN_CONFIG
+        };
+
+        assert_eq!(scanner.scan(b"12345").unwrap().matching_rules().len(), 1);
+
+        configure_yara_scanner(&mut scanner, config);
+
+        assert_eq!(scanner.scan(b"12345").unwrap().matching_rules().len(), 0);
+    }
+
     fn scan_args(target: PathBuf, database: PathBuf, yara_rules_cache: PathBuf) -> ScanArgs {
         ScanArgs {
             target,
             database,
             yara_rules_cache,
             output_format: OutputFormat::Human,
+            scan_config: crate::cli::DEFAULT_SCAN_CONFIG,
         }
     }
 
@@ -658,7 +693,7 @@ mod tests {
             help_text(),
             "\
 Usage:
-  galen scan <target> [--database <path>] [--yara-cache <path>] [--output <format>]
+  galen scan <target> [options]
   galen update [--database <path>] [--yara-dir <path>] [--yara-cache <path>]
   galen --help
 
@@ -671,6 +706,18 @@ Options:
       --yara-dir <path>   Path to source YARA rules directory
   -y, --yara-cache <path> Path to compiled YARA rules cache
   -o, --output            The output format for scan results: human (default) or json  
+      --max-archive-depth <count>
+                           Maximum nested archive depth (default: 5)
+      --max-archive-entries <count>
+                           Maximum entries per archive tree (default: 10,000)
+      --max-decompressed-file-size-bytes <bytes>
+                           Maximum decompressed entry size (default: 64 MiB)
+      --max-file-size-bytes <bytes>
+                           Maximum filesystem file size (default: 64 MiB)
+      --retained-entry-buffer-limit-bytes <bytes>
+                           Retained archive buffer limit (default: 4 MiB)
+      --yara-scan-timeout-seconds <seconds>
+                           YARA scan timeout (default: 10 seconds)
   -h, --help              Show this help text
 "
         );

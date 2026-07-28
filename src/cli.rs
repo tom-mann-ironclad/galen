@@ -1,8 +1,21 @@
-use std::{env::VarError, fmt, path::PathBuf};
+use std::{env::VarError, fmt, path::PathBuf, time::Duration};
+
+use crate::scanner::scan::ScanConfig;
 
 const DEFAULT_DATABASE: &str = "./signature_database.sqlite";
 const DEFAULT_YARA_DIR: &str = "./yara/";
 const DEFAULT_YARA_CACHE: &str = "./yara/compiled/galen.yaraxc";
+pub const DEFAULT_SCAN_CONFIG: ScanConfig = ScanConfig {
+    max_archive_depth: 5,
+    max_archive_entries: 10_000,
+    max_decompressed_file_size_bytes: 67_108_864,
+    max_file_size_bytes: 67_108_864,
+    zip_eocd_min_size_bytes: 22,
+    zip_max_comment_size_bytes: u16::MAX as usize,
+    zip64_eocd_locator_size_bytes: 20,
+    retained_entry_buffer_limit_bytes: 4_194_304,
+    yara_scan_timeout: Duration::from_secs(10),
+};
 
 /// Commands which the user can use with the CLI.
 pub enum Command {
@@ -21,6 +34,8 @@ pub struct ScanArgs {
     pub yara_rules_cache: PathBuf,
     /// The output format to be used.
     pub output_format: OutputFormat,
+    /// Resource limits applied during the scan.
+    pub scan_config: ScanConfig,
 }
 
 /// The arguments which an `Update` command needs.
@@ -51,6 +66,7 @@ pub enum CliError {
     MultipleScanTargetsProvided,
     NoScanTargetProvided,
     UnknownParameterProvided,
+    InvalidParameterValue(String),
     AuthKeyEnvironment(VarError),
 }
 
@@ -65,6 +81,9 @@ impl fmt::Display for CliError {
             }
             CliError::NoScanTargetProvided => write!(formatter, "No scan target provided"),
             CliError::UnknownParameterProvided => write!(formatter, "Unknown parameter provided"),
+            CliError::InvalidParameterValue(parameter) => {
+                write!(formatter, "Invalid value for {parameter}")
+            }
             CliError::AuthKeyEnvironment(err) => write!(formatter, "{err}"),
         }
     }
@@ -112,6 +131,7 @@ where
     let mut database = PathBuf::from(DEFAULT_DATABASE);
     let mut yara_rules_cache = PathBuf::from(DEFAULT_YARA_CACHE);
     let mut output_format = OutputFormat::Human;
+    let mut scan_config = DEFAULT_SCAN_CONFIG;
 
     let mut args = args.into_iter();
 
@@ -139,6 +159,25 @@ where
                 output_format = OutputFormat::from(value);
             }
 
+            "--max-archive-depth" => {
+                scan_config.max_archive_depth = parse_usize(&mut args, &arg)?;
+            }
+            "--max-archive-entries" => {
+                scan_config.max_archive_entries = parse_usize(&mut args, &arg)?;
+            }
+            "--max-decompressed-file-size-bytes" => {
+                scan_config.max_decompressed_file_size_bytes = parse_u64(&mut args, &arg)?;
+            }
+            "--max-file-size-bytes" => {
+                scan_config.max_file_size_bytes = parse_u64(&mut args, &arg)?;
+            }
+            "--retained-entry-buffer-limit-bytes" => {
+                scan_config.retained_entry_buffer_limit_bytes = parse_usize(&mut args, &arg)?;
+            }
+            "--yara-scan-timeout-seconds" => {
+                scan_config.yara_scan_timeout = Duration::from_secs(parse_u64(&mut args, &arg)?);
+            }
+
             value if value.starts_with("-") => {
                 return Err(CliError::UnknownArgumentProvided);
             }
@@ -164,7 +203,28 @@ where
         database,
         yara_rules_cache,
         output_format,
+        scan_config,
     }))
+}
+
+fn parse_u64<I>(args: &mut I, parameter: &str) -> Result<u64, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let value = args.next().ok_or(CliError::NoArgumentsProvided)?;
+    value
+        .parse()
+        .map_err(|_| CliError::InvalidParameterValue(parameter.to_string()))
+}
+
+fn parse_usize<I>(args: &mut I, parameter: &str) -> Result<usize, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let value = args.next().ok_or(CliError::NoArgumentsProvided)?;
+    value
+        .parse()
+        .map_err(|_| CliError::InvalidParameterValue(parameter.to_string()))
 }
 
 fn parse_update<I>(args: I) -> Result<Command, CliError>
@@ -311,6 +371,21 @@ mod tests {
         assert_eq!(scan.database, PathBuf::from(DEFAULT_DATABASE));
         assert_eq!(scan.yara_rules_cache, PathBuf::from(DEFAULT_YARA_CACHE));
         assert!(matches!(scan.output_format, OutputFormat::Human));
+        assert_eq!(scan.scan_config.max_archive_depth, 5);
+        assert_eq!(scan.scan_config.max_archive_entries, 10_000);
+        assert_eq!(
+            scan.scan_config.max_decompressed_file_size_bytes,
+            67_108_864
+        );
+        assert_eq!(scan.scan_config.max_file_size_bytes, 67_108_864);
+        assert_eq!(scan.scan_config.zip_eocd_min_size_bytes, 22);
+        assert_eq!(scan.scan_config.zip_max_comment_size_bytes, 65_535);
+        assert_eq!(scan.scan_config.zip64_eocd_locator_size_bytes, 20);
+        assert_eq!(
+            scan.scan_config.retained_entry_buffer_limit_bytes,
+            4_194_304
+        );
+        assert_eq!(scan.scan_config.yara_scan_timeout, Duration::from_secs(10));
     }
 
     #[test]
@@ -336,6 +411,53 @@ mod tests {
         assert_eq!(scan.database, PathBuf::from("hashes.sqlite"));
         assert_eq!(scan.yara_rules_cache, PathBuf::from("rules.yaraxc"));
         assert!(matches!(scan.output_format, OutputFormat::Json));
+    }
+
+    #[test]
+    fn parse_scan_accepts_custom_resource_limits() {
+        let command = parse_args(args(&[
+            "galen",
+            "scan",
+            "--max-archive-depth",
+            "3",
+            "--max-archive-entries",
+            "250",
+            "--max-decompressed-file-size-bytes",
+            "1048576",
+            "--max-file-size-bytes",
+            "2097152",
+            "--retained-entry-buffer-limit-bytes",
+            "524288",
+            "--yara-scan-timeout-seconds",
+            "4",
+            "samples",
+        ]))
+        .unwrap();
+
+        let Command::Scan(scan) = command else {
+            panic!("expected scan command");
+        };
+
+        assert_eq!(scan.scan_config.max_archive_depth, 3);
+        assert_eq!(scan.scan_config.max_archive_entries, 250);
+        assert_eq!(scan.scan_config.max_decompressed_file_size_bytes, 1_048_576);
+        assert_eq!(scan.scan_config.max_file_size_bytes, 2_097_152);
+        assert_eq!(scan.scan_config.retained_entry_buffer_limit_bytes, 524_288);
+        assert_eq!(scan.scan_config.yara_scan_timeout, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn parse_scan_rejects_invalid_resource_limits() {
+        assert_eq!(
+            parse_error(&[
+                "galen",
+                "scan",
+                "--max-file-size-bytes",
+                "large",
+                "target.bin",
+            ]),
+            CliError::InvalidParameterValue("--max-file-size-bytes".to_string())
+        );
     }
 
     #[test]

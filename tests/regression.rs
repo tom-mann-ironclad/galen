@@ -124,26 +124,34 @@ struct ScanRunner {
 impl ScanRunner {
     /// Runs Galen against one target and parses its JSON report.
     fn scan(&self, target: impl AsRef<Path>) -> ScanOutput {
+        self.scan_with_args(target, std::iter::empty::<&str>())
+    }
+
+    /// Runs Galen with additional scan options and parses its JSON report.
+    fn scan_with_args<'a, I>(&self, target: impl AsRef<Path>, args: I) -> ScanOutput
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let target = target.as_ref();
         let output = Command::new(&self.binary)
             .arg("scan")
-            .arg(target.as_ref())
+            .arg(target)
             .arg("--database")
             .arg(&self.database)
             .arg("--yara-cache")
             .arg(&self.yara_cache)
             .arg("--output")
             .arg("json")
+            .args(args)
             .output()
-            .unwrap_or_else(|err| {
-                panic!("run galen scan for {}: {err}", target.as_ref().display())
-            });
+            .unwrap_or_else(|err| panic!("run galen scan for {}: {err}", target.display()));
 
         let stdout = String::from_utf8(output.stdout).expect("scan stdout is UTF-8");
         let stderr = String::from_utf8(output.stderr).expect("scan stderr is UTF-8");
         let json = serde_json::from_str(&stdout).unwrap_or_else(|err| {
             panic!(
                 "scan stdout was not valid JSON for {}\nerr: {err}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-                target.as_ref().display()
+                target.display()
             )
         });
 
@@ -274,6 +282,146 @@ fn run_smoke_regression(runner: &ScanRunner, corpus: &Path, manifest: &TomlValue
         runner,
         &corpus.join("security_regressions/zip_limits/declared_10001_entries.zip"),
         "ZIP entry-count preflight regression",
+    );
+    assert_configured_archive_depth_increases_skips(
+        runner,
+        &corpus.join("archives/malicious/eicar_zip_inside_zip.zip"),
+    );
+    assert_configured_archive_entries_increases_skips(
+        runner,
+        &corpus.join("archives/malicious/eicar_zip.zip"),
+    );
+    assert_configured_decompressed_size_increases_skips(
+        runner,
+        &corpus.join("archives/malicious/eicar_zip.zip"),
+    );
+    assert_configured_file_size_increases_skips(
+        runner,
+        &corpus.join("malicious/synthetic/eicar/eicar.com"),
+    );
+    assert_non_threshold_config_overrides_scan_successfully(
+        runner,
+        &corpus.join("archives/malicious/eicar_zip.zip"),
+    );
+}
+
+/// Verifies that the CLI archive-depth option reaches the recursive scanner.
+fn assert_configured_archive_depth_increases_skips(runner: &ScanRunner, target: &Path) {
+    let default_scan = runner.scan(target);
+    let constrained_scan = runner.scan_with_args(target, ["--max-archive-depth", "1"]);
+
+    default_scan.assert_status_ok("default archive-depth scan");
+    constrained_scan.assert_status_ok("constrained archive-depth scan");
+
+    let default_skips = default_scan.json["summary"]["skipped_files"]
+        .as_u64()
+        .expect("default skipped_files is an integer");
+    let constrained_skips = constrained_scan.json["summary"]["skipped_files"]
+        .as_u64()
+        .expect("constrained skipped_files is an integer");
+
+    assert!(
+        constrained_skips > default_skips,
+        "max archive depth 1 should increase skipped files\ndefault stdout:\n{}\nconstrained stdout:\n{}",
+        default_scan.stdout,
+        constrained_scan.stdout
+    );
+    assert!(
+        constrained_scan.has_skip_reason("maximum_recursion_reached"),
+        "constrained scan should report maximum_recursion_reached\nstdout:\n{}\nstderr:\n{}",
+        constrained_scan.stdout,
+        constrained_scan.stderr
+    );
+}
+
+/// Verifies that the CLI archive-entry option reaches ZIP preflight checks.
+fn assert_configured_archive_entries_increases_skips(runner: &ScanRunner, target: &Path) {
+    assert_limit_increases_skips(
+        runner,
+        target,
+        ["--max-archive-entries", "0"],
+        "maximum_archive_entries_reached",
+        "maximum archive entries",
+    );
+}
+
+/// Verifies that the CLI decompressed-size option reaches archive entry scanning.
+fn assert_configured_decompressed_size_increases_skips(runner: &ScanRunner, target: &Path) {
+    assert_limit_increases_skips(
+        runner,
+        target,
+        ["--max-decompressed-file-size-bytes", "1"],
+        "maximum_decompressed_size_reached",
+        "maximum decompressed file size",
+    );
+}
+
+/// Verifies that the CLI file-size option reaches filesystem file scanning.
+fn assert_configured_file_size_increases_skips(runner: &ScanRunner, target: &Path) {
+    assert_limit_increases_skips(
+        runner,
+        target,
+        ["--max-file-size-bytes", "1"],
+        "maximum_file_size_reached",
+        "maximum file size",
+    );
+}
+
+/// Checks a configured threshold against the same target's default skip count.
+fn assert_limit_increases_skips(
+    runner: &ScanRunner,
+    target: &Path,
+    args: [&str; 2],
+    reason: &str,
+    label: &str,
+) {
+    let default_scan = runner.scan(target);
+    let constrained_scan = runner.scan_with_args(target, args);
+    default_scan.assert_status_ok(&format!("default {label} scan"));
+    constrained_scan.assert_status_ok(&format!("constrained {label} scan"));
+
+    let skipped_files = |scan: &ScanOutput| {
+        scan.json["summary"]["skipped_files"]
+            .as_u64()
+            .expect("skipped_files is an integer")
+    };
+
+    assert!(
+        skipped_files(&constrained_scan) > skipped_files(&default_scan),
+        "configured {label} should increase skipped files\ndefault stdout:\n{}\nconstrained stdout:\n{}",
+        default_scan.stdout,
+        constrained_scan.stdout
+    );
+    assert!(
+        constrained_scan.has_skip_reason(reason),
+        "configured {label} should report {reason}\nstdout:\n{}\nstderr:\n{}",
+        constrained_scan.stdout,
+        constrained_scan.stderr
+    );
+}
+
+/// Exercises config options whose internal effects are not stable report counters.
+fn assert_non_threshold_config_overrides_scan_successfully(runner: &ScanRunner, target: &Path) {
+    let result = runner.scan_with_args(
+        target,
+        [
+            "--retained-entry-buffer-limit-bytes",
+            "0",
+            "--yara-scan-timeout-seconds",
+            "2",
+        ],
+    );
+
+    result.assert_status_ok("retained-buffer and YARA-timeout override scan");
+    assert_eq!(
+        result.code, 1,
+        "configured scan should retain its detection"
+    );
+    assert!(
+        result.has_inner_archive_detection(),
+        "configured scan should still inspect the archive entry\nstdout:\n{}\nstderr:\n{}",
+        result.stdout,
+        result.stderr
     );
 }
 

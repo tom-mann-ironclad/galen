@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/tom-mann-ironclad/galen/actions/workflows/ci.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/ci.yaml)
 [![Nightly Packages](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml)
-[![Code Coverage](https://img.shields.io/badge/coverage-82.5%25-brightgreen)](#testing-and-build-assurance)
-[![Mutation Score](https://img.shields.io/badge/mutation_score-82.1%25-brightgreen)](#testing-and-build-assurance)
+[![Code Coverage](https://img.shields.io/badge/coverage-81.8%25-brightgreen)](#testing-and-build-assurance)
+[![Mutation Score](https://img.shields.io/badge/mutation_score-84.8%25-brightgreen)](#testing-and-build-assurance)
 ![GitHub License](https://img.shields.io/github/license/tom-mann-ironclad/galen)
 
 Galen is an alpha-stage static malware scanner and security intelligence pipeline for Linux, written in Rust.
@@ -176,6 +176,23 @@ Galen can represent nested archive paths such as:
 ```
 
 This makes it possible to distinguish detections originating from filesystem files, archive entries, and archive containers.
+
+#### Default scan limits
+
+Galen's defaults are intended to scan ordinary software packages and documents while placing finite bounds on work triggered by unusually large files, deeply nested archives, and decompression bombs. They are conservative starting points rather than a guarantee that every hostile input is safe on every machine. Systems with unusually little memory, strict latency requirements, or trusted large artifacts may need tighter or looser values.
+
+| Limit | Default | Why this is a sensible starting point |
+| --- | ---: | --- |
+| Archive depth | 5 levels | Handles common nested packaging, such as a compressed TAR containing another archive, without allowing an attacker to create an effectively unbounded recursive chain. |
+| Archive entries | 10,000 per top-level archive tree | Accommodates sizeable application archives while bounding parser work and metadata overhead. The count is cumulative across nested archives, so splitting entries among child archives does not bypass it. |
+| Filesystem file size | 64 MiB | Covers most executables, scripts, documents, and package members while avoiding hashing and YARA scanning arbitrarily large files. YARA uses this same ceiling so the scanner does not apply two conflicting definitions of an acceptable file size. |
+| Decompressed file size | 64 MiB per entry | Allows typical expanded files but stops a small compressed member from expanding into an unbounded in-memory buffer. This limit applies independently of the compressed container size. |
+| Retained archive-entry buffer | 4 MiB | Small allocations are reused to reduce allocator churn. Buffers that grow beyond 4 MiB are released after the entry is scanned so one large member does not permanently raise memory use for the remainder of the archive. This is a retention threshold, not a scan-size limit. |
+| YARA timeout | 10 seconds per scan | Gives complex rules reasonable time on accepted files while bounding pathological rule or input combinations. The timeout applies to each YARA operation, not the entire directory scan. |
+
+These limits can be changed with the corresponding `galen scan` options shown by `galen --help`. When a size or archive threshold is reached, Galen records an explicit skip reason in human and JSON reports.
+
+The ZIP EOCD and ZIP64 locator sizes stored in `ScanConfig` use values defined by the ZIP format (22 bytes, a maximum 65,535-byte comment, and a 20-byte ZIP64 locator). They bound the footer search and are not exposed as CLI policy controls because changing them can make valid ZIP parsing unreliable.
 
 ### Reporting and automation
 

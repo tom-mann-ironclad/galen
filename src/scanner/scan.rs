@@ -42,12 +42,12 @@ pub struct ScanConfig {
 const TEST_SCAN_CONFIG: ScanConfig = ScanConfig {
     max_archive_depth: 5,
     max_archive_entries: 10_000,
-    max_decompressed_file_size_bytes: 64 * 1024 * 1024,
-    max_file_size_bytes: 64 * 1024 * 1024,
+    max_decompressed_file_size_bytes: 67_108_864,
+    max_file_size_bytes: 67_108_864,
     zip_eocd_min_size_bytes: 22,
     zip_max_comment_size_bytes: u16::MAX as usize,
     zip64_eocd_locator_size_bytes: 20,
-    retained_entry_buffer_limit_bytes: 4 * 1024 * 1024,
+    retained_entry_buffer_limit_bytes: 4_194_304,
     yara_scan_timeout: Duration::from_secs(10),
 };
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1748,6 +1748,68 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(payload).unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn zip_eocd(entry_count: u16, comment: &[u8]) -> Vec<u8> {
+        let mut eocd = vec![0_u8; 22];
+        eocd[..4].copy_from_slice(b"PK\x05\x06");
+        eocd[8..10].copy_from_slice(&entry_count.to_le_bytes());
+        eocd[10..12].copy_from_slice(&entry_count.to_le_bytes());
+        eocd[20..22].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+        eocd.extend_from_slice(comment);
+        eocd
+    }
+
+    #[test]
+    fn zip_declared_entry_count_validates_standard_and_zip64_footers() {
+        let mut short = Cursor::new(vec![0_u8; 21]);
+        assert_eq!(
+            zip_declared_entry_count(&mut short, TEST_SCAN_CONFIG).unwrap(),
+            None
+        );
+
+        let mut standard = Cursor::new(zip_eocd(7, b"abc"));
+        assert_eq!(
+            zip_declared_entry_count(&mut standard, TEST_SCAN_CONFIG).unwrap(),
+            Some(7)
+        );
+
+        let mut truncated_zip64 = Cursor::new(zip_eocd(u16::MAX, b""));
+        assert_eq!(
+            zip_declared_entry_count(&mut truncated_zip64, TEST_SCAN_CONFIG).unwrap(),
+            None
+        );
+
+        let mut zip64 = vec![0_u8; 40];
+        zip64[..4].copy_from_slice(b"PK\x06\x06");
+        zip64[32..40].copy_from_slice(&70_000_u64.to_le_bytes());
+        let mut locator = [0_u8; 20];
+        locator[..4].copy_from_slice(b"PK\x06\x07");
+        locator[8..16].copy_from_slice(&0_u64.to_le_bytes());
+        zip64.extend_from_slice(&locator);
+        zip64.extend_from_slice(&zip_eocd(u16::MAX, b""));
+
+        let mut valid_zip64 = Cursor::new(zip64.clone());
+        assert_eq!(
+            zip_declared_entry_count(&mut valid_zip64, TEST_SCAN_CONFIG).unwrap(),
+            Some(70_000)
+        );
+
+        let mut invalid_locator_bytes = zip64.clone();
+        invalid_locator_bytes[40..44].copy_from_slice(b"NOPE");
+        let mut invalid_locator = Cursor::new(invalid_locator_bytes);
+        assert_eq!(
+            zip_declared_entry_count(&mut invalid_locator, TEST_SCAN_CONFIG).unwrap(),
+            None
+        );
+
+        let mut invalid_zip64_bytes = zip64;
+        invalid_zip64_bytes[..4].copy_from_slice(b"NOPE");
+        let mut invalid_zip64 = Cursor::new(invalid_zip64_bytes);
+        assert_eq!(
+            zip_declared_entry_count(&mut invalid_zip64, TEST_SCAN_CONFIG).unwrap(),
+            None
+        );
     }
 
     fn hash_database_for_payload(payload: &[u8]) -> (tempfile::NamedTempFile, HashDatabase) {
