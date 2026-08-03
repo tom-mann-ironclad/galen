@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches:
       - main
@@ -55,3 +56,84 @@ jobs:
           path: |
             dist/galen-linux-x86_64-snapshot-*
             dist/checksums.txt
+
+  mutation:
+    name: Mutation score ratchet
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --version 25.0.0 --locked
+
+      - name: Run mutation tests
+        env:
+          YRX_REGENERATE_MODULES_RS: "false"
+        run: |
+          set +e
+          cargo mutants --timeout 25
+          MUTANTS_EXIT=$?
+          set -e
+
+          if [[ ! -f mutants.out/outcomes.json ]]; then
+            echo "cargo-mutants exited with ${MUTANTS_EXIT} without producing outcomes.json"
+            exit 1
+          fi
+
+          python3 scripts/check-mutation-score.py mutants.out/outcomes.json
+
+      - name: Upload mutation results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-results-${{ github.sha }}
+          path: mutants.out/
+          if-no-files-found: warn
+
+  coverage:
+    name: Unit-test coverage ratchet
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --version 0.31.5 --locked
+
+      - name: Enforce unit-test coverage ratchet
+        env:
+          CCACHE_DISABLE: "1"
+          YRX_REGENERATE_MODULES_RS: "false"
+        run: |
+          mkdir -p coverage
+          set -o pipefail
+          cargo tarpaulin \
+            --locked \
+            --engine Ptrace \
+            --fail-under 81.5 \
+            --out Html Json \
+            --output-dir coverage \
+            2>&1 | tee coverage/tarpaulin.log
+
+      - name: Upload coverage results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-test-coverage-${{ github.sha }}
+          path: coverage/
+          if-no-files-found: warn

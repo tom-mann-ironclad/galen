@@ -12,12 +12,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  quality:
+    name: Quality metrics
+    uses: ./.github/workflows/ci.yaml
+
   regression:
     name: Full regression
     uses: ./.github/workflows/regression.yaml
 
   deploy-nightly:
-    needs: [regression]
+    needs: [regression, quality]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -28,6 +32,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y apt-utils createrepo-c
           cargo install cargo-deb cargo-generate-rpm
+
+      - name: Download mutation report
+        uses: actions/download-artifact@v7
+        with:
+          name: mutation-results-${{ github.sha }}
+          path: quality-results/mutation
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v7
+        with:
+          name: unit-test-coverage-${{ github.sha }}
+          path: quality-results/coverage
 
       - name: Import GPG Key
         id: import-gpg
@@ -80,6 +96,13 @@ jobs:
           cd dist/dnf
           createrepo_c .
           echo "${{ secrets.GPG_PASSPHRASE }}" | gpg --batch --yes --passphrase-fd 0 --detach-sign --local-user "${{ steps.import-gpg.outputs.keyid }}" --armor repodata/repomd.xml
+
+      - name: Generate dynamic badge data
+        run: |
+          python3 scripts/generate-quality-badges.py \
+            --mutation quality-results/mutation/outcomes.json \
+            --coverage-log quality-results/coverage/tarpaulin.log \
+            --output dist/badges
 
       # Sync to the 'nightly/' path. Note the '--delete' flag on both passes 
       # to ensure yesterday's packages are dropped.

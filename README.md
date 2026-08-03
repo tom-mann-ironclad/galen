@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/tom-mann-ironclad/galen/actions/workflows/ci.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/ci.yaml)
 [![Nightly Packages](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml)
-[![Code Coverage](https://img.shields.io/badge/coverage-81.8%25-brightgreen)](#testing-and-build-assurance)
-[![Mutation Score](https://img.shields.io/badge/mutation_score-84.8%25-brightgreen)](#testing-and-build-assurance)
+[![Code Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fpackages.ironclad-software.com%2Fnightly%2Fbadges%2Fcoverage.json&cacheSeconds=3600)](#testing-and-build-assurance)
+[![Mutation Score](https://img.shields.io/endpoint?url=https%3A%2F%2Fpackages.ironclad-software.com%2Fnightly%2Fbadges%2Fmutation.json&cacheSeconds=3600)](#testing-and-build-assurance)
 ![GitHub License](https://img.shields.io/github/license/tom-mann-ironclad/galen)
 
 Galen is an alpha-stage static malware scanner and security intelligence pipeline for Linux, written in Rust.
@@ -452,11 +452,16 @@ CI and release builds perform checks including:
 * Regression tests
 * RustSec advisory checks
 * Release compilation
+* A blocking mutation-score ratchet
 * CycloneDX SBOM generation
 * Checksumming
 * SLSA provenance generation
 
 Security advisory failures are treated as release blockers.
+
+Mutation testing is also blocking in normal CI. The checked-in ratchet requires at least an 84.5% score and permits at most one timed-out mutant. Caught, missed, and timed-out mutants are included in the score denominator; mutants that cannot compile are excluded. The threshold should only move upwards as surviving mutants are eliminated or documented, preventing later changes from silently giving back mutation coverage.
+
+Unit-test coverage has a separate blocking ratchet measured with cargo-tarpaulin. CI currently requires at least 81.5% line coverage and uploads the HTML and JSON reports for inspection. As with mutation testing, this floor should only move upwards so new changes cannot silently trade away established test coverage.
 
 Normal CI artifacts are development snapshots and are not releases. Tagged alpha releases use versions such as:
 
