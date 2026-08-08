@@ -57,10 +57,15 @@ jobs:
             dist/galen-linux-x86_64-snapshot-*
             dist/checksums.txt
 
-  mutation:
-    name: Mutation score ratchet
+  mutation-shard:
+    name: Mutation tests (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # cargo-mutants numbers shards from zero.
+        shard: [0, 1, 2, 3]
 
     steps:
       - uses: actions/checkout@v7
@@ -79,7 +84,7 @@ jobs:
           YRX_REGENERATE_MODULES_RS: "false"
         run: |
           set +e
-          cargo mutants --timeout 25
+          cargo mutants --timeout 25 --shard "${{ matrix.shard }}/4"
           MUTANTS_EXIT=$?
           set -e
 
@@ -88,9 +93,42 @@ jobs:
             exit 1
           fi
 
-          python3 scripts/check-mutation-score.py mutants.out/outcomes.json
+      - name: Upload mutation shard results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-results-${{ github.sha }}-${{ matrix.shard }}
+          path: mutants.out/
+          if-no-files-found: warn
 
-      - name: Upload mutation results
+  mutation:
+    name: Mutation score ratchet
+    needs: mutation-shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download mutation shard results
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mutation-results-${{ github.sha }}-*
+          path: mutation-shards
+
+      - name: Aggregate and enforce mutation score ratchet
+        run: |
+          mapfile -t OUTCOMES < <(find mutation-shards -name outcomes.json -type f | sort)
+          if [[ "${#OUTCOMES[@]}" -ne 4 ]]; then
+            echo "Expected 4 mutation shard reports, found ${#OUTCOMES[@]}"
+            exit 1
+          fi
+          python3 scripts/check-mutation-score.py \
+            --output mutants.out/outcomes.json \
+            "${OUTCOMES[@]}"
+
+      - name: Upload combined mutation results
         if: always()
         uses: actions/upload-artifact@v7
         with:
