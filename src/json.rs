@@ -1,8 +1,6 @@
-use crate::{
-    DetectionRecord,
-    scanner::heuristics::Finding,
-    scanner::scan::{DetectionSurface, ScanSummaryStats, SkipReason},
-    should_display_detection,
+use crate::scanner::{
+    heuristics::Finding,
+    scan::{DetectionRecord, DetectionSurface, ScanSummaryStats, SkipReason},
 };
 use serde::Serialize;
 
@@ -10,6 +8,26 @@ use serde::Serialize;
 pub enum ReportStatus {
     Ok,
     Error,
+}
+
+/// Determine whether an archive container has a child detection that preserves
+/// the container's verdict in the visible report.
+fn has_child_detection(container: &DetectionRecord, records: &[DetectionRecord]) -> bool {
+    let prefix = format!("{}!/", container.path.to_string_lossy());
+
+    records.iter().any(|record| {
+        record.surface != DetectionSurface::FileSystemFile
+            && record.verdict >= container.verdict
+            && record.path.to_string_lossy().starts_with(&prefix)
+    })
+}
+
+/// Determine which detection records should be displayed.
+pub fn should_display_detection(record: &DetectionRecord, records: &[DetectionRecord]) -> bool {
+    match record.surface {
+        DetectionSurface::FileSystemFile | DetectionSurface::ArchiveEntry => true,
+        DetectionSurface::ArchiveContainer => !has_child_detection(record, records),
+    }
 }
 
 impl ReportStatus {

@@ -1,30 +1,25 @@
-pub mod cli;
-pub mod json;
-pub mod scanner;
-pub mod updater;
-
 use std::{
     io::{self, Write},
     time::Duration,
 };
 
-use crate::scanner::{
+use galen::scanner::{
     database::load_hash_database,
     heuristics::Verdict,
     scan::{DetectionRecord, DetectionSurface, ScanSummaryStats, SkipReason},
     scan::{ScanConfig, scan_path},
     yara::load_yara_rules_cache,
 };
-use crate::updater::{
+use galen::updater::{
     update_signatures::{
         UpdateSignaturesError, UpdateSignaturesOutcome, update_signatures_using_malware_bazaar,
     },
     update_yara_rules::{UpdateYaraRulesError, update_yara_rules},
 };
 
-use crate::cli::{Command, OutputFormat, ScanArgs, UpdateArgs, parse_args};
+use galen::cli::{Command, OutputFormat, ScanArgs, UpdateArgs, parse_args};
 
-use crate::json::{ErrorReport, ScanReport};
+use galen::json::{ErrorReport, ScanReport, should_display_detection};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_DETECTIONS: i32 = 1;
@@ -518,31 +513,10 @@ where
     write!(output, "{}", help_text())
 }
 
-/// Determine whether an archive container has a child detection that preserves
-/// the container's verdict in the visible report.
-fn has_child_detection(container: &DetectionRecord, records: &[DetectionRecord]) -> bool {
-    let prefix = format!("{}!/", container.path.to_string_lossy());
-
-    records.iter().any(|record| {
-        record.surface != DetectionSurface::FileSystemFile
-            && record.verdict >= container.verdict
-            && record.path.to_string_lossy().starts_with(&prefix)
-    })
-}
-
-/// Function to determine which detection records should be displayed.
-pub fn should_display_detection(record: &DetectionRecord, records: &[DetectionRecord]) -> bool {
-    match record.surface {
-        DetectionSurface::FileSystemFile => true,
-        DetectionSurface::ArchiveEntry => true,
-        DetectionSurface::ArchiveContainer => !has_child_detection(record, records),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scanner::heuristics::{
+    use galen::scanner::heuristics::{
         Confidence, Finding, FindingId, MAX_FINDINGS_PER_FILE, Verdict,
     };
     use std::path::{Path, PathBuf};
@@ -614,7 +588,7 @@ mod tests {
         let mut scanner = yara_x::Scanner::new(&rules);
         let config = ScanConfig {
             max_file_size_bytes: 4,
-            ..crate::cli::DEFAULT_SCAN_CONFIG
+            ..galen::cli::DEFAULT_SCAN_CONFIG
         };
 
         assert_eq!(scanner.scan(b"12345").unwrap().matching_rules().len(), 1);
@@ -630,7 +604,7 @@ mod tests {
             database,
             yara_rules_cache,
             output_format: OutputFormat::Human,
-            scan_config: crate::cli::DEFAULT_SCAN_CONFIG,
+            scan_config: galen::cli::DEFAULT_SCAN_CONFIG,
         }
     }
 

@@ -20,6 +20,85 @@ jobs:
     name: Full regression
     uses: ./.github/workflows/regression.yaml
 
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_zip, fuzz_tar, fuzz_gzip]
+
+    env:
+      CARGO_FUZZ_VERSION: 0.12.0
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+          cache-on-failure: true
+
+      - name: Cache cargo-fuzz
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.tool_cache }}/cargo-fuzz
+          key: cargo-fuzz-${{ runner.os }}-${{ env.CARGO_FUZZ_VERSION }}
+
+      - name: Install cargo-fuzz
+        run: |
+          echo "${{ runner.tool_cache }}/cargo-fuzz/bin" >> "$GITHUB_PATH"
+          if [[ ! -x "${{ runner.tool_cache }}/cargo-fuzz/bin/cargo-fuzz" ]]; then
+            cargo install \
+              --root "${{ runner.tool_cache }}/cargo-fuzz" \
+              --version "$CARGO_FUZZ_VERSION" \
+              cargo-fuzz \
+              --locked
+          fi
+
+      - name: Run ${{ matrix.target }} for five minutes
+        id: fuzz
+        run: |
+          set -o pipefail
+          mkdir -p fuzz-results
+          cargo fuzz run "${{ matrix.target }}" -- \
+            -max_total_time=300 \
+            -max_len=1048576 \
+            -timeout=10 \
+            -rss_limit_mb=2048 \
+            2>&1 | tee "fuzz-results/${{ matrix.target }}.log"
+
+      - name: Summarise fuzz result
+        if: always()
+        run: |
+          if [[ "${{ steps.fuzz.outcome }}" == "failure" ]]; then
+            {
+              echo "::warning::${{ matrix.target }} found a crash or failed to complete"
+              echo "### ${{ matrix.target }} requires investigation"
+              echo '```sh'
+              echo "cargo +nightly fuzz run ${{ matrix.target }} fuzz/artifacts/${{ matrix.target }}/<artifact>"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### ${{ matrix.target }} completed its five-minute run" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload fuzz results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-results-${{ matrix.target }}-${{ github.sha }}
+          path: |
+            fuzz-results/${{ matrix.target }}.log
+            fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: warn
+
   deploy-nightly:
     needs: [regression, quality]
     runs-on: ubuntu-latest

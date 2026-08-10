@@ -1,0 +1,40 @@
+[package]
+name = "galen-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+flate2 = "1.1.9"
+galen = { path = ".." }
+libfuzzer-sys = "0.4.13"
+tar = "0.4.46"
+yara-x = "1.19.0"
+zip = "8.6.0"
+
+[[bin]]
+name = "fuzz_zip"
+path = "fuzz_targets/fuzz_zip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tar"
+path = "fuzz_targets/fuzz_tar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_gzip"
+path = "fuzz_targets/fuzz_gzip.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

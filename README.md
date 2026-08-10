@@ -437,12 +437,13 @@ Current testing includes:
 * Path-handling tests
 * Detection-report tests
 * Mutation testing
+* Nightly ZIP, TAR, and GZIP fuzzing
 * Code coverage measurement
 * False-positive testing against Debian
 * False-positive testing against Fedora
 * False-positive testing against Arch Linux
 
-Fuzzing is being added for parser, archive, and hostile-input paths. Surviving mutants are also being reviewed and documented where they expose meaningful gaps or deliberate equivalences.
+ZIP, TAR, and GZIP archive parsers are fuzzed in parallel during nightly builds. Each target receives both raw malformed bytes and generated valid containers, uses strict scan limits, and runs for five minutes. Fuzz findings do not block nightly package publication; logs and reproducing inputs are retained as workflow artifacts for investigation. Surviving mutants are also being reviewed and documented where they expose meaningful gaps or deliberate equivalences.
 
 CI and release builds perform checks including:
 
@@ -462,6 +463,26 @@ Security advisory failures are treated as release blockers.
 Mutation testing is also blocking in normal CI. The checked-in ratchet requires at least an 84.5% score and permits at most one timed-out mutant. Caught, missed, and timed-out mutants are included in the score denominator; mutants that cannot compile are excluded. The threshold should only move upwards as surviving mutants are eliminated or documented, preventing later changes from silently giving back mutation coverage.
 
 Unit-test coverage has a separate blocking ratchet measured with cargo-tarpaulin. CI currently requires at least 81.5% line coverage and uploads the HTML and JSON reports for inspection. As with mutation testing, this floor should only move upwards so new changes cannot silently trade away established test coverage.
+
+Archive fuzz targets require nightly Rust and `cargo-fuzz`. Build all targets locally with:
+
+```sh
+cargo +nightly fuzz build
+```
+
+Run a short smoke test or a longer local session with:
+
+```sh
+cargo +nightly fuzz run fuzz_zip -- -runs=100
+cargo +nightly fuzz run fuzz_tar
+cargo +nightly fuzz run fuzz_gzip
+```
+
+Reproduce a CI finding by downloading its artifact and passing the crash input to the corresponding target:
+
+```sh
+cargo +nightly fuzz run fuzz_zip fuzz/artifacts/fuzz_zip/crash-<hash>
+```
 
 Normal CI artifacts are development snapshots and are not releases. Tagged alpha releases use versions such as:
 

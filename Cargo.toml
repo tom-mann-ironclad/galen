@@ -13,7 +13,7 @@ publish = false
 rust-version = "1.95.0"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(tarpaulin)'] }
 
 # --- Debian Packaging Configuration ---
 [package.metadata.deb]

@@ -15,6 +15,18 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+// Malformed inputs are the normal case while fuzzing. Keep libFuzzer's output
+// focused on coverage and actionable failures without changing production
+// diagnostics.
+#[cfg(fuzzing)]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        if false {
+            std::eprintln!($($arg)*);
+        }
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Resource limits applied while scanning files and archive trees.
 pub struct ScanConfig {
@@ -393,6 +405,72 @@ enum ArchiveKind {
     Tar,
     Gzip,
     Unknown,
+}
+
+/// Archive parser selected by the `cargo-fuzz` harnesses.
+///
+/// This interface is deliberately absent from normal and release builds. It
+/// lets fuzz targets enter a parser directly instead of relying on magic-byte
+/// detection to preserve a particular header during mutation.
+#[cfg(fuzzing)]
+#[derive(Debug, Clone, Copy)]
+pub enum FuzzArchiveKind {
+    Zip,
+    Tar,
+    Gzip,
+}
+
+/// Exercise one in-memory archive parser with the production recursion and
+/// resource-limit implementation.
+#[cfg(fuzzing)]
+pub fn fuzz_archive_bytes(
+    kind: FuzzArchiveKind,
+    bytes: &[u8],
+    hash_database: &HashDatabase,
+    yara_scanner: &mut yara_x::Scanner,
+    config: ScanConfig,
+) -> ScanSummaryStats {
+    let mut summary = ScanSummaryStats::new();
+    let path = match kind {
+        FuzzArchiveKind::Zip => Path::new("fuzz.zip"),
+        FuzzArchiveKind::Tar => Path::new("fuzz.tar"),
+        FuzzArchiveKind::Gzip => Path::new("fuzz.gz"),
+    };
+
+    let result = match kind {
+        FuzzArchiveKind::Zip => scan_zip_archive_with_config(
+            Cursor::new(bytes),
+            path,
+            hash_database,
+            yara_scanner,
+            &mut summary,
+            0,
+            config,
+        ),
+        FuzzArchiveKind::Tar => scan_tar_archive_with_config(
+            Cursor::new(bytes),
+            path,
+            hash_database,
+            yara_scanner,
+            &mut summary,
+            0,
+            config,
+        ),
+        FuzzArchiveKind::Gzip => scan_gzip_reader_with_config(
+            Cursor::new(bytes),
+            path,
+            hash_database,
+            yara_scanner,
+            &mut summary,
+            0,
+            config,
+        ),
+    };
+
+    // Parser errors are expected fuzz outcomes. Panics, sanitizer findings,
+    // timeouts, and memory-limit failures remain visible to libFuzzer.
+    let _ = result;
+    summary
 }
 
 pub fn scan_path(
