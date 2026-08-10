@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "summary": {
+    "scanned_files": 2,
+    "filesystem_files": 1,
+    "archive_entries": 1,
+    "scanned_archives": 1,
+    "skipped_files": 2,
+    "skips": [
+      {
+        "reason": "zero_size",
+        "count": 1
+      },
+      {
+        "reason": "permission_denied",
+        "count": 1
+      }
+    ],
+    "raw_detection_records": 2,
+    "visible_detection_records": 1,
+    "suppressed_detection_records": 1,
+    "raw_detections_by_surface": [
+      {
+        "surface": "archive_entry",
+        "count": 1
+      },
+      {
+        "surface": "archive_container",
+        "count": 1
+      }
+    ],
+    "scan_time_ms": 25.0
+  },
+  "yara": {
+    "rules_triggered": [
+      {
+        "rule": "a_rule",
+        "files": 2
+      },
+      {
+        "rule": "z_rule",
+        "files": 1
+      }
+    ]
+  },
+  "visible_detections": [
+    {
+      "path": "sample.zip!/payload",
+      "score": 90,
+      "verdict": "malicious",
+      "surface": "archive_entry",
+      "findings": [
+        {
+          "id": "known_hash",
+          "score": 90,
+          "confidence": "high"
+        }
+      ]
+    }
+  ],
+  "suppressed_detections": [
+    {
+      "path": "sample.zip",
+      "score": 90,
+      "verdict": "malicious",
+      "surface": "archive_container",
+      "findings": [
+        {
+          "id": "known_hash",
+          "score": 90,
+          "confidence": "high"
+        }
+      ]
+    }
+  ]
+}

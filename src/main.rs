@@ -521,6 +521,11 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
 
+    const SUCCESS_JSON_GOLDEN: &str =
+        include_str!("../tests/fixtures/json/scan-report-v1-success.json");
+    const ERROR_JSON_GOLDEN: &str =
+        include_str!("../tests/fixtures/json/scan-report-v1-error.json");
+
     /// Backend used in testing as a mock.
     struct FakeUpdateBackend {
         signatures: Result<UpdateSignaturesOutcome, UpdateSignaturesError>,
@@ -997,6 +1002,66 @@ Options:
         assert!(stdout.contains("\"schema_version\": 1"));
         assert!(stdout.contains("\"scan_time_ms\": 5.0"));
         assert_eq!(stderr, "Errors: 2\n");
+    }
+
+    #[test]
+    fn json_scan_stdout_matches_v1_golden_fixture() {
+        let mut summary = ScanSummaryStats::new();
+        summary.filesystem_files_scanned = 1;
+        summary.archive_entries_scanned = 1;
+        summary.archives_scanned = 1;
+        summary.record_skip(SkipReason::ZeroSize);
+        summary.record_skip(SkipReason::PermissionDenied);
+        summary.detections = vec![
+            detection(
+                "sample.zip",
+                DetectionSurface::ArchiveContainer,
+                Verdict::Malicious,
+            ),
+            detection(
+                "sample.zip!/payload",
+                DetectionSurface::ArchiveEntry,
+                Verdict::Malicious,
+            ),
+        ];
+        for record in &mut summary.detections {
+            record.score = 90;
+            record.findings[0] = Some(Finding {
+                id: FindingId::KnownHash,
+                score: 90,
+                confidence: Confidence::High,
+            });
+        }
+        summary.yara_rules_triggered.insert("z_rule".to_string(), 1);
+        summary.yara_rules_triggered.insert("a_rule".to_string(), 2);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = write_json_scan_report(
+            &summary,
+            Duration::from_millis(25),
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert_eq!(exit_code, EXIT_DETECTIONS);
+        assert_eq!(String::from_utf8(stdout).unwrap(), SUCCESS_JSON_GOLDEN);
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn json_error_stdout_matches_v1_golden_fixture() {
+        let mut stdout = Vec::new();
+
+        write_json_error_report(
+            "signature_database_load_failed",
+            "unable to open database".to_string(),
+            &mut stdout,
+        )
+        .unwrap();
+
+        assert_eq!(String::from_utf8(stdout).unwrap(), ERROR_JSON_GOLDEN);
     }
 
     #[test]

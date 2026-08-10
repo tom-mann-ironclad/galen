@@ -277,6 +277,9 @@ mod tests {
     use crate::scanner::heuristics::{Confidence, FindingId, Verdict};
     use std::{path::PathBuf, time::Duration};
 
+    const SUCCESS_GOLDEN: &str = include_str!("../tests/fixtures/json/scan-report-v1-success.json");
+    const ERROR_GOLDEN: &str = include_str!("../tests/fixtures/json/scan-report-v1-error.json");
+
     fn detection(path: &str, surface: DetectionSurface, score: u16) -> DetectionRecord {
         let mut findings = [None; crate::scanner::heuristics::MAX_FINDINGS_PER_FILE];
         findings[0] = Some(Finding {
@@ -379,5 +382,37 @@ mod tests {
         assert_eq!(report.status, "error");
         assert_eq!(report.error.kind, "signature_database_load_failed");
         assert_eq!(report.error.message, "unable to open database");
+    }
+
+    #[test]
+    fn successful_scan_report_matches_v1_golden_fixture() {
+        let mut summary = ScanSummaryStats::new();
+        summary.filesystem_files_scanned = 1;
+        summary.archive_entries_scanned = 1;
+        summary.archives_scanned = 1;
+        summary.record_skip(SkipReason::ZeroSize);
+        summary.record_skip(SkipReason::PermissionDenied);
+        summary.detections = vec![
+            detection("sample.zip", DetectionSurface::ArchiveContainer, 90),
+            detection("sample.zip!/payload", DetectionSurface::ArchiveEntry, 90),
+        ];
+        summary.yara_rules_triggered.insert("z_rule".to_string(), 1);
+        summary.yara_rules_triggered.insert("a_rule".to_string(), 2);
+
+        let report = ScanReport::from_summary(&summary, Duration::from_millis(25));
+        let actual = serde_json::to_string_pretty(&report).unwrap();
+
+        assert_eq!(actual, SUCCESS_GOLDEN.trim_end());
+    }
+
+    #[test]
+    fn error_report_matches_v1_golden_fixture() {
+        let report = ErrorReport::new(
+            "signature_database_load_failed",
+            "unable to open database".to_string(),
+        );
+        let actual = serde_json::to_string_pretty(&report).unwrap();
+
+        assert_eq!(actual, ERROR_GOLDEN.trim_end());
     }
 }

@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "status": "error",
+  "error": {
+    "kind": "signature_database_load_failed",
+    "message": "unable to open database"
+  }
+}

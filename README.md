@@ -284,6 +284,10 @@ Version 1 is documented by:
 schemas/scan-report-v1.schema.json
 ```
 
+Representative success and error output is pinned by golden fixtures in
+`tests/fixtures/json`. Tests compare the complete JSON written to stdout, so an
+intentional output change must update the schema version and fixtures together.
+
 A successfully completed scan uses:
 
 ```json
