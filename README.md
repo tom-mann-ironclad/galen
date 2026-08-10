@@ -287,6 +287,9 @@ schemas/scan-report-v1.schema.json
 Representative success and error output is pinned by golden fixtures in
 `tests/fixtures/json`. Tests compare the complete JSON written to stdout, so an
 intentional output change must update the schema version and fixtures together.
+Pull-request CI also validates those fixtures against the version of the v1
+schema on the target branch, preventing accidental breaking changes to the
+published machine-readable contract.
 
 A successfully completed scan uses:
 

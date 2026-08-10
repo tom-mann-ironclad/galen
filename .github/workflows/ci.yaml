@@ -17,6 +17,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -31,6 +33,10 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked
+
+      - name: Check JSON output compatibility with main
+        if: github.event_name == 'pull_request'
+        run: scripts/check-json-schema-compatibility.sh "${{ github.event.pull_request.base.sha }}"
 
       - name: Build snapshot binary
         run: cargo build --release --locked

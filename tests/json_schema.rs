@@ -1,4 +1,5 @@
 use serde_json::{Map, Value};
+use std::{env, fs};
 
 const SCHEMA_SOURCE: &str = include_str!("../schemas/scan-report-v1.schema.json");
 const SUCCESS_REPORT: &str = include_str!("fixtures/json/scan-report-v1-success.json");
@@ -6,7 +7,12 @@ const ERROR_REPORT: &str = include_str!("fixtures/json/scan-report-v1-error.json
 
 #[test]
 fn golden_json_reports_match_the_v1_schema() {
-    let schema: Value = serde_json::from_str(SCHEMA_SOURCE).expect("v1 schema is valid JSON");
+    let schema_source = match env::var_os("GALEN_JSON_SCHEMA_PATH") {
+        Some(path) => fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read compatibility schema {path:?}: {error}")),
+        None => SCHEMA_SOURCE.to_string(),
+    };
+    let schema: Value = serde_json::from_str(&schema_source).expect("v1 schema is valid JSON");
 
     for (name, source) in [
         ("success report", SUCCESS_REPORT),
