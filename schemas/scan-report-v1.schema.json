@@ -319,7 +319,7 @@
         "rootkit_indicator",
         "packer_indicator",
         "static_lrd_preload_reference",
-        "writable_executable_segement",
+        "writable_executable_segment",
         "runtime_memfd_exec"
       ]
     },

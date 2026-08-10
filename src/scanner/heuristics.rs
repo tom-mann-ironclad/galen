@@ -79,7 +79,7 @@ impl FindingId {
             FindingId::YaraRootkitIndicator => "rootkit indicator",
             FindingId::YaraPackerIndicator => "packer indicator",
             FindingId::StaticLdPreloadReference => "static LRD preload reference",
-            FindingId::ElfWritableExecutableSegment => "writable executable segement",
+            FindingId::ElfWritableExecutableSegment => "writable executable segment",
             FindingId::RuntimeMemfdExec => "runtime memfd exec",
         }
     }
@@ -93,7 +93,7 @@ impl FindingId {
             FindingId::YaraRootkitIndicator => "rootkit_indicator",
             FindingId::YaraPackerIndicator => "packer_indicator",
             FindingId::StaticLdPreloadReference => "static_lrd_preload_reference",
-            FindingId::ElfWritableExecutableSegment => "writable_executable_segement",
+            FindingId::ElfWritableExecutableSegment => "writable_executable_segment",
             FindingId::RuntimeMemfdExec => "runtime_memfd_exec",
         }
     }
@@ -269,8 +269,8 @@ mod tests {
             ),
             (
                 FindingId::ElfWritableExecutableSegment,
-                "writable executable segement",
-                "writable_executable_segement",
+                "writable executable segment",
+                "writable_executable_segment",
             ),
             (
                 FindingId::RuntimeMemfdExec,
