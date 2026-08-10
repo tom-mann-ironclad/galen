@@ -1266,7 +1266,9 @@ Options:
 
     #[test]
     fn hash_database_freshness_warning_uses_one_week_boundary() {
-        let week = HASH_DATABASE_MAX_AGE_SECONDS;
+        // Keep the expected duration independent of the production expression so
+        // arithmetic changes to the configured one-week threshold are observable.
+        let week = 604_800;
 
         assert_eq!(hash_database_freshness_warning(Some(1), week), None);
         assert_eq!(
