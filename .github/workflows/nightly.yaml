@@ -31,7 +31,7 @@ jobs:
         target: [fuzz_zip, fuzz_tar, fuzz_gzip]
 
     env:
-      CARGO_FUZZ_VERSION: 0.12.0
+      CARGO_FUZZ_VERSION: 0.13.2
 
     steps:
       - uses: actions/checkout@v7
