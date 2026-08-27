@@ -619,6 +619,29 @@ fn open_scan_file(path: &Path) -> Result<File, OpenScanFileError> {
         })
 }
 
+/// Open a directory atomically and classify expected skip conditions. Using
+/// `O_NOFOLLOW` here mirrors `open_scan_file`: if the final path component
+/// was swapped for a symlink since it was last classified, the open fails
+/// instead of silently following it. Combined with `O_DIRECTORY`, the
+/// kernel reports this as `ENOTDIR` rather than `ELOOP` (it never resolves
+/// the symlink far enough to know it would have looped), so both codes are
+/// treated as the same "no longer the directory we expected" condition.
+fn open_scan_directory(path: &Path) -> Result<File, OpenScanFileError> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+        .map_err(|err| {
+            if matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) {
+                OpenScanFileError::Symlink
+            } else if err.kind() == ErrorKind::PermissionDenied {
+                OpenScanFileError::PermissionDenied
+            } else {
+                OpenScanFileError::Other(err)
+            }
+        })
+}
+
 /// Function to scan a file and report the results by modifying the provided summary.
 fn scan_one_and_report(
     path: &Path,
@@ -852,7 +875,37 @@ fn scan_directory(
     summary: &mut ScanSummaryStats,
     config: ScanConfig,
 ) {
-    let entries = match std::fs::read_dir(directory) {
+    let dir_handle = match open_scan_directory(directory) {
+        Ok(handle) => handle,
+        Err(OpenScanFileError::Symlink) => {
+            summary.record_skip(SkipReason::FileIsSymLink);
+            return;
+        }
+        Err(OpenScanFileError::PermissionDenied) => {
+            summary.record_skip(SkipReason::PermissionDenied);
+            eprintln!("Skipping {}: permission denied", directory.display());
+            return;
+        }
+        Err(OpenScanFileError::Other(err)) => {
+            summary.errors += 1;
+            eprintln!(
+                "Could not open directory {:?}: {}",
+                directory.display(),
+                err
+            );
+            return;
+        }
+    };
+
+    // List entries through the descriptor opened above rather than
+    // re-resolving `directory` by path. Re-resolving here would reopen the
+    // TOCTOU gap `open_scan_directory` just closed: the path could be
+    // replaced (e.g. with a symlink) between the open and a second
+    // path-based lookup. `/proc/self/fd` pins the listing to the exact
+    // inode already verified, matching the pattern `scan_file_yara` uses
+    // for files.
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", dir_handle.as_raw_fd()));
+    let entries = match std::fs::read_dir(&descriptor_path) {
         Ok(entries) => entries,
         Err(err) if err.kind() == ErrorKind::PermissionDenied => {
             summary.record_skip(SkipReason::PermissionDenied);
@@ -872,7 +925,7 @@ fn scan_directory(
 
     scan_directory_entry_paths(
         directory,
-        entries.map(|entry| entry.map(|entry| entry.path())),
+        entries.map(|entry| entry.map(|entry| directory.join(entry.file_name()))),
         hash_database,
         yara_scanner,
         summary,
@@ -2485,6 +2538,59 @@ mod tests {
         let mut contents = Vec::new();
         opened.read_to_end(&mut contents).unwrap();
         assert_eq!(contents, b"original contents");
+    }
+
+    #[test]
+    fn open_scan_directory_opens_existing_directory() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let opened = open_scan_directory(directory.path()).unwrap();
+
+        assert!(opened.metadata().unwrap().is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_scan_directory_classifies_symbolic_links_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target_dir");
+        let link = directory.path().join("link_dir");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = open_scan_directory(&link).unwrap_err();
+
+        assert!(matches!(err, OpenScanFileError::Symlink));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_directory_does_not_follow_directory_replaced_by_symlink() {
+        // Simulates the TOCTOU race this guards against: a caller
+        // classified `scan_dir` as a real directory, but by the time
+        // `scan_directory` opens it, the path has been swapped for a
+        // symlink pointing outside the scan root. Before O_NOFOLLOW was
+        // added to directory opens, this would have followed the symlink
+        // and scanned the attacker-controlled contents behind it.
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let scan_dir = root.path().join("scan_dir");
+        std::fs::create_dir(&scan_dir).unwrap();
+        std::fs::write(outside.path().join("secret.bin"), b"outside contents").unwrap();
+
+        std::fs::remove_dir(&scan_dir).unwrap();
+        symlink(outside.path(), &scan_dir).unwrap();
+
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+
+        scan_directory(&scan_dir, &database, &mut scanner, &mut summary);
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.filesystem_files_scanned, 0);
+        assert_eq!(summary.skip_count(SkipReason::FileIsSymLink), 1);
     }
 
     #[test]
