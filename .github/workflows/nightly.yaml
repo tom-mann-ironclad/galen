@@ -233,6 +233,122 @@ jobs:
           path: bench-results/
           if-no-files-found: warn
 
+  live-sample-testing:
+    name: Live sample testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Observability only, for now: a missed detection or a scan failure on a
+    # real live sample is a more meaningful signal than the ClamAV
+    # benchmark's timing numbers, but Malware Bazaar availability and its
+    # fair-use limits can still cause external flakes unrelated to galen.
+    # Revisit once a detection-rate baseline exists (see TODO.md: "Live
+    # sample testing in CI").
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install job dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq unzip
+
+      - name: Build release binary and YARA compiler
+        run: |
+          cargo build --release --locked
+          cargo build --release --locked --example compile_yara_cache
+
+      - name: Determine cache date
+        id: date
+        run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      # Shares a cache key with benchmark-clamav's signature database so a
+      # warm database (and therefore `galen update`'s incremental "recent"
+      # path rather than a full bootstrap) is available whenever either job
+      # has already run today. See update_signatures_with_client in
+      # src/updater/update_signatures.rs: an empty database always
+      # bootstraps from Malware Bazaar's full export, which can lag behind
+      # the very latest samples this job just downloaded.
+      - name: Cache Malware Bazaar signature database
+        uses: actions/cache@v5
+        with:
+          path: signature_database.sqlite
+          key: malware-bazaar-db-${{ steps.date.outputs.date }}
+          restore-keys: |
+            malware-bazaar-db-
+
+      - name: Compile local YARA rules
+        run: target/release/examples/compile_yara_cache yara/ yara/compiled/galen.yaraxc
+
+      - name: Fetch live malware samples
+        id: fetch
+        env:
+          GALEN_AUTH_KEY: ${{ secrets.MALWARE_BAZAAR_AUTH_KEY }}
+        run: |
+          if [[ -z "${GALEN_AUTH_KEY:-}" ]]; then
+            echo "::warning::MALWARE_BAZAAR_AUTH_KEY not set; skipping live sample testing"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          scripts/live-samples/fetch-live-samples.sh \
+            --out-dir "$RUNNER_TEMP/live-samples" \
+            --count 15
+
+      - name: Update signature database
+        if: steps.fetch.outputs.skip != 'true'
+        env:
+          GALEN_AUTH_KEY: ${{ secrets.MALWARE_BAZAAR_AUTH_KEY }}
+        run: |
+          target/release/galen update \
+            --database signature_database.sqlite \
+            --yara-dir yara/ \
+            --yara-cache yara/compiled/galen.yaraxc
+
+      - name: Scan live samples
+        if: steps.fetch.outputs.skip != 'true'
+        run: |
+          target/release/galen scan "$RUNNER_TEMP/live-samples/samples" \
+            --database signature_database.sqlite \
+            --yara-cache yara/compiled/galen.yaraxc \
+            --output json \
+            > "$RUNNER_TEMP/live-samples/scan.json" || true
+
+      - name: Check verdicts
+        if: steps.fetch.outputs.skip != 'true'
+        run: |
+          scripts/live-samples/check-verdicts.sh \
+            --manifest "$RUNNER_TEMP/live-samples/manifest.json" \
+            --scan-json "$RUNNER_TEMP/live-samples/scan.json" \
+            --out-dir live-sample-results
+
+      - name: Publish summary
+        if: always() && steps.fetch.outputs.skip != 'true'
+        run: |
+          if [[ -f live-sample-results/live-sample-summary.md ]]; then
+            cat live-sample-results/live-sample-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload verdict report
+        if: always() && steps.fetch.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-sample-results-${{ github.sha }}
+          path: live-sample-results/
+          if-no-files-found: warn
+
+      # Raw live samples never leave $RUNNER_TEMP (not the working tree, not
+      # an artifact) but are removed explicitly rather than left for the
+      # runner teardown, since this step also runs on failure.
+      - name: Remove downloaded samples
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/live-samples"
+
   deploy-nightly:
     needs: [regression, quality]
     runs-on: ubuntu-latest

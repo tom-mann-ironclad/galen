@@ -498,12 +498,15 @@ Current testing includes:
 * Detection-report tests
 * Mutation testing
 * Nightly ZIP, TAR, and GZIP fuzzing
+* Nightly live-sample testing against Malware Bazaar
 * Code coverage measurement
 * False-positive testing against Debian
 * False-positive testing against Fedora
 * False-positive testing against Arch Linux
 
 ZIP, TAR, and GZIP archive parsers are fuzzed in parallel during nightly builds. Each target receives both raw malformed bytes and generated valid containers, uses strict scan limits, and runs for five minutes. Fuzz findings do not block nightly package publication; logs and reproducing inputs are retained as workflow artifacts for investigation. Surviving mutants are also being reviewed and documented where they expose meaningful gaps or deliberate equivalences.
+
+The EICAR and AMTSO fixtures under `test_files/` are inert stand-ins; they say nothing about how galen handles a real, currently-circulating threat. Nightly builds also download a small batch (up to 15) of real, live malware samples from Malware Bazaar (`scripts/live-samples/`), scan them after a fresh signature update, and report how many were flagged malicious. Samples are downloaded to the runner's temporary directory, never committed or written into the working tree, and deleted before the job ends regardless of outcome - only hashes, families, and verdicts leave the runner, in an uploaded build artifact and the job summary. This job is observability-only for now (a Malware Bazaar hiccup or fair-use limit can cause an unrelated flake); it does not gate nightly package publication.
 
 CI and release builds perform checks including:
 
