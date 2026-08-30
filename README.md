@@ -511,6 +511,8 @@ They are early engineering measurements, not formal independent performance clai
 | Galen   | YARA enabled |   ~355k |   12m 28s |  ~187 MB |            78,072 |                       19,939 |
 | ClamAV  |    Recursive |   ~300k |   72m 45s | ~1.19 GB |        60,728,859 |                      225,140 |
 
+These numbers came from a one-off manual run and are not reproducible as published. An automated version of this comparison now runs nightly (`.github/workflows/nightly.yaml`, job `benchmark-clamav`) against a smaller, pinned, reproducible corpus (`scripts/bench/`), and its results are uploaded as a build artifact rather than gating the build. Treat the table above as historical context until it is refreshed from that job's output.
+
 This comparison is not intended as criticism of ClamAV.
 
 ClamAV is a mature, widely deployed, production-grade scanner with a substantially broader feature set, larger detection database, wider format support, and many years of operational hardening.

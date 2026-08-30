@@ -99,6 +99,140 @@ jobs:
             fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: warn
 
+  benchmark-clamav:
+    name: Benchmark against ClamAV
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Observability only: report results, do not fail the nightly build.
+    # GitHub-hosted runners are shared and noisy enough that hard-gating on
+    # wall-clock time before a stable baseline exists would be a source of
+    # false alarms rather than signal. Revisit once a few weeks of nightly
+    # results establish normal run-to-run variance.
+    continue-on-error: true
+
+    # Pinned YARA Forge release fed into `galen update --yara-dir` (or the
+    # compile_yara_cache fallback below) to give Galen a representative
+    # ruleset. Bump alongside corpus-manifest.txt when deliberately
+    # refreshing the benchmark baseline.
+    env:
+      YARA_FORGE_TAG: "20260823"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary and benchmark tooling
+        run: |
+          cargo build --release --locked
+          cargo build --release --locked --example compile_yara_cache
+
+      - name: Install benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clamav clamav-freshclam sqlite3 time unzip
+
+      - name: Determine cache date
+        id: date
+        run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ClamAV signature database
+        uses: actions/cache@v5
+        with:
+          path: /var/lib/clamav
+          key: clamav-db-${{ steps.date.outputs.date }}
+          restore-keys: |
+            clamav-db-
+
+      - name: Update ClamAV signatures
+        run: |
+          sudo systemctl stop clamav-freshclam || true
+          sudo freshclam || echo "::warning::freshclam failed; benchmarking against whatever database is available"
+
+      # Without this, every nightly run starts from a clean checkout and
+      # `galen update` treats the missing database as a first run, doing a
+      # full Malware Bazaar bootstrap download instead of an incremental
+      # fetch. Only matters once MALWARE_BAZAAR_AUTH_KEY is set; harmless
+      # no-op otherwise.
+      - name: Cache Malware Bazaar signature database
+        uses: actions/cache@v5
+        with:
+          path: signature_database.sqlite
+          key: malware-bazaar-db-${{ steps.date.outputs.date }}
+          restore-keys: |
+            malware-bazaar-db-
+
+      - name: Prepare benchmark corpus
+        run: scripts/bench/prepare-corpus.sh bench-corpus
+
+      - name: Fetch pinned YARA Forge core ruleset
+        run: |
+          mkdir -p yara
+          curl -sSL -o /tmp/yara-forge-core.zip \
+            "https://github.com/YARAHQ/yara-forge/releases/download/${YARA_FORGE_TAG}/yara-forge-rules-core.zip"
+          unzip -q -o /tmp/yara-forge-core.zip -d yara/
+
+      # Best-effort: try a real update when the secret is available, then
+      # fall back for whichever artifact is still missing afterward. A
+      # failed `galen update` (bad/rate-limited key, network hiccup) is
+      # reported but not fatal - if a cached database from a previous run
+      # is still on disk, we benchmark with that rather than losing the
+      # whole night's run.
+      - name: Update signatures and compile YARA rules
+        env:
+          GALEN_AUTH_KEY: ${{ secrets.MALWARE_BAZAAR_AUTH_KEY }}
+        run: |
+          if [[ -n "${GALEN_AUTH_KEY:-}" ]]; then
+            echo "MALWARE_BAZAAR_AUTH_KEY is set: running galen update for a real signature database"
+            target/release/galen update \
+              --database signature_database.sqlite \
+              --yara-dir yara/ \
+              --yara-cache yara/compiled/galen.yaraxc \
+              || echo "::warning::galen update failed; benchmarking with whatever database and rules cache resulted"
+          else
+            echo "::warning::MALWARE_BAZAAR_AUTH_KEY not set; benchmarking with an empty signature database"
+          fi
+
+          if [[ ! -f signature_database.sqlite ]]; then
+            sqlite3 signature_database.sqlite "CREATE TABLE malware_hashes (sha256 BLOB);"
+          fi
+
+          if [[ ! -f yara/compiled/galen.yaraxc ]]; then
+            target/release/examples/compile_yara_cache yara/ yara/compiled/galen.yaraxc
+          fi
+
+      - name: Run benchmark
+        run: |
+          scripts/bench/run-benchmark.sh \
+            --galen-bin target/release/galen \
+            --database signature_database.sqlite \
+            --yara-cache yara/compiled/galen.yaraxc \
+            --corpus bench-corpus \
+            --out-dir bench-results
+
+      - name: Publish benchmark summary
+        if: always()
+        run: |
+          if [[ -f bench-results/benchmark-summary.md ]]; then
+            {
+              echo "### ClamAV benchmark"
+              cat bench-results/benchmark-summary.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: clamav-benchmark-${{ github.sha }}
+          path: bench-results/
+          if-no-files-found: warn
+
   deploy-nightly:
     needs: [regression, quality]
     runs-on: ubuntu-latest
