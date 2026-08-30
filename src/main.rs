@@ -488,7 +488,8 @@ Options:
   -d, --database <path>   Path to signature database
       --yara-dir <path>   Path to source YARA rules directory
   -y, --yara-cache <path> Path to compiled YARA rules cache
-  -o, --output            The output format for scan results: human (default) or json  
+  -o, --output            The output format for scan results: human (default) or json
+      --config <path>     Path to a TOML config file (default: ./galen.toml, if present)
       --max-archive-depth <count>
                            Maximum nested archive depth (default: 5)
       --max-archive-entries <count>
@@ -502,6 +503,11 @@ Options:
       --yara-scan-timeout-seconds <seconds>
                            YARA scan timeout (default: 10 seconds)
   -h, --help              Show this help text
+
+Settings may also come from GALEN_* environment variables or the config
+file, with precedence CLI flags > environment variables > config file >
+built-in defaults. See README.md for the full list of variables and the
+config file schema.
 "
 }
 
@@ -684,7 +690,8 @@ Options:
   -d, --database <path>   Path to signature database
       --yara-dir <path>   Path to source YARA rules directory
   -y, --yara-cache <path> Path to compiled YARA rules cache
-  -o, --output            The output format for scan results: human (default) or json  
+  -o, --output            The output format for scan results: human (default) or json
+      --config <path>     Path to a TOML config file (default: ./galen.toml, if present)
       --max-archive-depth <count>
                            Maximum nested archive depth (default: 5)
       --max-archive-entries <count>
@@ -698,6 +705,11 @@ Options:
       --yara-scan-timeout-seconds <seconds>
                            YARA scan timeout (default: 10 seconds)
   -h, --help              Show this help text
+
+Settings may also come from GALEN_* environment variables or the config
+file, with precedence CLI flags > environment variables > config file >
+built-in defaults. See README.md for the full list of variables and the
+config file schema.
 "
         );
     }

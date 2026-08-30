@@ -1,5 +1,6 @@
 use std::{env::VarError, fmt, path::PathBuf, time::Duration};
 
+use crate::config::{self, ConfigOverrides};
 use crate::scanner::scan::ScanConfig;
 
 const DEFAULT_DATABASE: &str = "./signature_database.sqlite";
@@ -68,6 +69,13 @@ pub enum CliError {
     UnknownParameterProvided,
     InvalidParameterValue(String),
     AuthKeyEnvironment(VarError),
+    Config(String),
+}
+
+impl From<config::ConfigError> for CliError {
+    fn from(err: config::ConfigError) -> Self {
+        CliError::Config(err.to_string())
+    }
 }
 
 impl fmt::Display for CliError {
@@ -85,6 +93,7 @@ impl fmt::Display for CliError {
                 write!(formatter, "Invalid value for {parameter}")
             }
             CliError::AuthKeyEnvironment(err) => write!(formatter, "{err}"),
+            CliError::Config(err) => write!(formatter, "{err}"),
         }
     }
 }
@@ -128,10 +137,8 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut target: Option<PathBuf> = None;
-    let mut database = PathBuf::from(DEFAULT_DATABASE);
-    let mut yara_rules_cache = PathBuf::from(DEFAULT_YARA_CACHE);
-    let mut output_format = OutputFormat::Human;
-    let mut scan_config = DEFAULT_SCAN_CONFIG;
+    let mut config_path: Option<PathBuf> = None;
+    let mut overrides = ConfigOverrides::default();
 
     let mut args = args.into_iter();
 
@@ -142,40 +149,47 @@ where
                     return Err(CliError::NoArgumentsProvided);
                 };
 
-                database = PathBuf::from(value);
+                overrides.database = Some(PathBuf::from(value));
             }
 
             "--yara-cache" | "-y" => {
                 let Some(value) = args.next() else {
                     return Err(CliError::NoArgumentsProvided);
                 };
-                yara_rules_cache = PathBuf::from(value);
+                overrides.yara_rules_cache = Some(PathBuf::from(value));
             }
 
             "--output" | "-o" => {
                 let Some(value) = args.next() else {
                     return Err(CliError::NoArgumentsProvided);
                 };
-                output_format = OutputFormat::from(value);
+                overrides.output_format = Some(value);
+            }
+
+            "--config" => {
+                let Some(value) = args.next() else {
+                    return Err(CliError::NoArgumentsProvided);
+                };
+                config_path = Some(PathBuf::from(value));
             }
 
             "--max-archive-depth" => {
-                scan_config.max_archive_depth = parse_usize(&mut args, &arg)?;
+                overrides.max_archive_depth = Some(parse_usize(&mut args, &arg)?);
             }
             "--max-archive-entries" => {
-                scan_config.max_archive_entries = parse_usize(&mut args, &arg)?;
+                overrides.max_archive_entries = Some(parse_usize(&mut args, &arg)?);
             }
             "--max-decompressed-file-size-bytes" => {
-                scan_config.max_decompressed_file_size_bytes = parse_u64(&mut args, &arg)?;
+                overrides.max_decompressed_file_size_bytes = Some(parse_u64(&mut args, &arg)?);
             }
             "--max-file-size-bytes" => {
-                scan_config.max_file_size_bytes = parse_u64(&mut args, &arg)?;
+                overrides.max_file_size_bytes = Some(parse_u64(&mut args, &arg)?);
             }
             "--retained-entry-buffer-limit-bytes" => {
-                scan_config.retained_entry_buffer_limit_bytes = parse_usize(&mut args, &arg)?;
+                overrides.retained_entry_buffer_limit_bytes = Some(parse_usize(&mut args, &arg)?);
             }
             "--yara-scan-timeout-seconds" => {
-                scan_config.yara_scan_timeout = Duration::from_secs(parse_u64(&mut args, &arg)?);
+                overrides.yara_scan_timeout_seconds = Some(parse_u64(&mut args, &arg)?);
             }
 
             value if value.starts_with("-") => {
@@ -197,6 +211,41 @@ where
     let Some(target) = target else {
         return Err(CliError::NoScanTargetProvided);
     };
+
+    let config_path = config::resolve_config_path(config_path, std::env::var("GALEN_CONFIG").ok());
+    let overrides =
+        config::resolve_scan_overrides(overrides, &config_path, |name| std::env::var(name).ok())?;
+
+    let database = overrides
+        .database
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATABASE));
+    let yara_rules_cache = overrides
+        .yara_rules_cache
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_YARA_CACHE));
+    let output_format = overrides
+        .output_format
+        .map(OutputFormat::from)
+        .unwrap_or(OutputFormat::Human);
+
+    let mut scan_config = DEFAULT_SCAN_CONFIG;
+    if let Some(value) = overrides.max_archive_depth {
+        scan_config.max_archive_depth = value;
+    }
+    if let Some(value) = overrides.max_archive_entries {
+        scan_config.max_archive_entries = value;
+    }
+    if let Some(value) = overrides.max_decompressed_file_size_bytes {
+        scan_config.max_decompressed_file_size_bytes = value;
+    }
+    if let Some(value) = overrides.max_file_size_bytes {
+        scan_config.max_file_size_bytes = value;
+    }
+    if let Some(value) = overrides.retained_entry_buffer_limit_bytes {
+        scan_config.retained_entry_buffer_limit_bytes = value;
+    }
+    if let Some(value) = overrides.yara_scan_timeout_seconds {
+        scan_config.yara_scan_timeout = Duration::from_secs(value);
+    }
 
     Ok(Command::Scan(ScanArgs {
         target,
@@ -231,9 +280,8 @@ fn parse_update<I>(args: I) -> Result<Command, CliError>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut database = PathBuf::from(DEFAULT_DATABASE);
-    let mut yara_rules_path = PathBuf::from(DEFAULT_YARA_DIR);
-    let mut yara_rules_cache = PathBuf::from(DEFAULT_YARA_CACHE);
+    let mut config_path: Option<PathBuf> = None;
+    let mut overrides = ConfigOverrides::default();
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -243,21 +291,27 @@ where
                     return Err(CliError::NoArgumentsProvided);
                 };
 
-                database = PathBuf::from(value);
+                overrides.database = Some(PathBuf::from(value));
             }
             "--yara-dir" => {
                 let Some(value) = args.next() else {
                     return Err(CliError::NoArgumentsProvided);
                 };
 
-                yara_rules_path = PathBuf::from(value);
+                overrides.yara_rules_path = Some(PathBuf::from(value));
             }
             "--yara-cache" | "-y" => {
                 let Some(value) = args.next() else {
                     return Err(CliError::NoArgumentsProvided);
                 };
 
-                yara_rules_cache = PathBuf::from(value);
+                overrides.yara_rules_cache = Some(PathBuf::from(value));
+            }
+            "--config" => {
+                let Some(value) = args.next() else {
+                    return Err(CliError::NoArgumentsProvided);
+                };
+                config_path = Some(PathBuf::from(value));
             }
             _other => return Err(CliError::UnknownParameterProvided),
         }
@@ -267,6 +321,20 @@ where
         Ok(key) => key,
         Err(err) => return Err(CliError::AuthKeyEnvironment(err)),
     };
+
+    let config_path = config::resolve_config_path(config_path, std::env::var("GALEN_CONFIG").ok());
+    let overrides =
+        config::resolve_update_overrides(overrides, &config_path, |name| std::env::var(name).ok())?;
+
+    let database = overrides
+        .database
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATABASE));
+    let yara_rules_path = overrides
+        .yara_rules_path
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_YARA_DIR));
+    let yara_rules_cache = overrides
+        .yara_rules_cache
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_YARA_CACHE));
 
     Ok(Command::Update(UpdateArgs {
         database,
@@ -341,12 +409,66 @@ mod env_test_support {
             }
         }
     }
+
+    /// Sets several environment variables under one ENV_LOCK acquisition.
+    /// Tests that need more than one GALEN_* variable set (e.g. an auth key
+    /// plus a config override) must use this rather than combining it with
+    /// `GalenAuthKeyGuard` in the same test: `Mutex` isn't reentrant, so two
+    /// live guards on the same thread would deadlock.
+    pub struct EnvVarsGuard {
+        previous: Vec<(String, Option<String>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvVarsGuard {
+        /// Holds ENV_LOCK without mutating anything. Any test that calls
+        /// `parse_scan`/`parse_update` reads real GALEN_* environment
+        /// variables now (via config::resolve_*_overrides), so even tests
+        /// that don't care about config layering need to hold ENV_LOCK for
+        /// their duration - otherwise they can observe a mutation made by a
+        /// concurrently running guarded test, since plain `std::env::var`
+        /// reads aren't themselves serialized by anything.
+        pub fn isolate() -> Self {
+            Self::set(&[])
+        }
+
+        pub fn set(pairs: &[(&str, &str)]) -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut previous = Vec::with_capacity(pairs.len());
+
+            for (name, value) in pairs {
+                previous.push(((*name).to_string(), std::env::var(name).ok()));
+                // SAFETY: see GalenAuthKeyGuard above; serialized by ENV_LOCK for
+                // this guard's lifetime.
+                unsafe { std::env::set_var(name, value) };
+            }
+
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvVarsGuard {
+        fn drop(&mut self) {
+            for (name, previous) in &self.previous {
+                match previous {
+                    // SAFETY: see GalenAuthKeyGuard above.
+                    Some(value) => unsafe { std::env::set_var(name, value) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::env_test_support::GalenAuthKeyGuard;
+    use crate::cli::env_test_support::{EnvVarsGuard, GalenAuthKeyGuard};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -361,6 +483,7 @@ mod tests {
 
     #[test]
     fn parse_scan_uses_defaults_for_optional_paths_and_human_output() {
+        let _guard = EnvVarsGuard::isolate();
         let command = parse_args(args(&["galen", "scan", "target.bin"])).unwrap();
 
         let Command::Scan(scan) = command else {
@@ -390,6 +513,7 @@ mod tests {
 
     #[test]
     fn parse_scan_accepts_custom_paths_and_json_output() {
+        let _guard = EnvVarsGuard::isolate();
         let command = parse_args(args(&[
             "galen",
             "scan",
@@ -415,6 +539,7 @@ mod tests {
 
     #[test]
     fn parse_scan_accepts_custom_resource_limits() {
+        let _guard = EnvVarsGuard::isolate();
         let command = parse_args(args(&[
             "galen",
             "scan",
@@ -448,6 +573,7 @@ mod tests {
 
     #[test]
     fn parse_scan_rejects_invalid_resource_limits() {
+        let _guard = EnvVarsGuard::isolate();
         assert_eq!(
             parse_error(&[
                 "galen",
@@ -462,6 +588,7 @@ mod tests {
 
     #[test]
     fn parse_scan_accepts_short_flags_and_falls_back_to_human_output() {
+        let _guard = EnvVarsGuard::isolate();
         let command = parse_args(args(&[
             "galen",
             "scan",
@@ -487,6 +614,7 @@ mod tests {
 
     #[test]
     fn parse_top_level_help_and_unknown_commands() {
+        let _guard = EnvVarsGuard::isolate();
         assert!(matches!(
             parse_args(args(&["galen", "help"])).unwrap(),
             Command::Help
@@ -497,6 +625,7 @@ mod tests {
 
     #[test]
     fn parse_scan_rejects_missing_and_duplicate_targets() {
+        let _guard = EnvVarsGuard::isolate();
         assert_eq!(
             parse_error(&["galen", "scan"]),
             CliError::NoScanTargetProvided
@@ -509,6 +638,7 @@ mod tests {
 
     #[test]
     fn parse_scan_rejects_unknown_flags_and_missing_values() {
+        let _guard = EnvVarsGuard::isolate();
         assert_eq!(
             parse_error(&["galen", "scan", "--unknown", "target"]),
             CliError::UnknownArgumentProvided
@@ -656,5 +786,156 @@ mod tests {
 
         assert!(matches!(err, CliError::AuthKeyEnvironment(_)));
         assert!(err.to_string().contains("environment variable not found"));
+    }
+
+    #[test]
+    fn parse_scan_applies_settings_from_config_file() {
+        let _guard = EnvVarsGuard::isolate();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("galen.toml");
+        std::fs::write(
+            &config_path,
+            "[scan]\ndatabase = \"file.sqlite\"\noutput = \"json\"\nmax_file_size_bytes = 555\n",
+        )
+        .unwrap();
+
+        let command = parse_args(args(&[
+            "galen",
+            "scan",
+            "--config",
+            config_path.to_str().unwrap(),
+            "target.bin",
+        ]))
+        .unwrap();
+
+        let Command::Scan(scan) = command else {
+            panic!("expected scan command");
+        };
+
+        assert_eq!(scan.database, PathBuf::from("file.sqlite"));
+        assert!(matches!(scan.output_format, OutputFormat::Json));
+        assert_eq!(scan.scan_config.max_file_size_bytes, 555);
+    }
+
+    #[test]
+    fn parse_scan_environment_overrides_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("galen.toml");
+        std::fs::write(
+            &config_path,
+            "[scan]\nmax_file_size_bytes = 111\nmax_archive_depth = 1\n",
+        )
+        .unwrap();
+        let _guard = EnvVarsGuard::set(&[("GALEN_MAX_FILE_SIZE_BYTES", "222")]);
+
+        let command = parse_args(args(&[
+            "galen",
+            "scan",
+            "--config",
+            config_path.to_str().unwrap(),
+            "target.bin",
+        ]))
+        .unwrap();
+
+        let Command::Scan(scan) = command else {
+            panic!("expected scan command");
+        };
+
+        // Environment wins over the file for max_file_size_bytes...
+        assert_eq!(scan.scan_config.max_file_size_bytes, 222);
+        // ...but the file still supplies whatever the environment didn't set.
+        assert_eq!(scan.scan_config.max_archive_depth, 1);
+    }
+
+    #[test]
+    fn parse_scan_cli_flag_overrides_environment_and_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("galen.toml");
+        std::fs::write(&config_path, "[scan]\nmax_file_size_bytes = 111\n").unwrap();
+        let _guard = EnvVarsGuard::set(&[("GALEN_MAX_FILE_SIZE_BYTES", "222")]);
+
+        let command = parse_args(args(&[
+            "galen",
+            "scan",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--max-file-size-bytes",
+            "333",
+            "target.bin",
+        ]))
+        .unwrap();
+
+        let Command::Scan(scan) = command else {
+            panic!("expected scan command");
+        };
+
+        assert_eq!(scan.scan_config.max_file_size_bytes, 333);
+    }
+
+    #[test]
+    fn parse_scan_reports_missing_explicit_config_file() {
+        let _guard = EnvVarsGuard::isolate();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+
+        let err = parse_error(&[
+            "galen",
+            "scan",
+            "--config",
+            missing.to_str().unwrap(),
+            "target.bin",
+        ]);
+
+        assert!(matches!(err, CliError::Config(_)));
+    }
+
+    #[test]
+    fn parse_scan_reports_invalid_environment_values() {
+        let _guard = EnvVarsGuard::set(&[("GALEN_MAX_FILE_SIZE_BYTES", "not-a-number")]);
+
+        let err = parse_error(&["galen", "scan", "target.bin"]);
+
+        assert!(matches!(err, CliError::Config(_)));
+    }
+
+    #[test]
+    fn parse_update_applies_config_file_for_yara_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("galen.toml");
+        std::fs::write(&config_path, "[update]\nyara_dir = \"file-rules\"\n").unwrap();
+        let _guard = EnvVarsGuard::set(&[("GALEN_AUTH_KEY", "test-auth-key")]);
+
+        let command = parse_args(args(&[
+            "galen",
+            "update",
+            "--config",
+            config_path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let Command::Update(update) = command else {
+            panic!("expected update command");
+        };
+
+        assert_eq!(update.yara_rules_path, PathBuf::from("file-rules"));
+    }
+
+    #[test]
+    fn parse_update_environment_variable_locates_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("galen.toml");
+        std::fs::write(&config_path, "[update]\nyara_dir = \"env-located-rules\"\n").unwrap();
+        let _guard = EnvVarsGuard::set(&[
+            ("GALEN_AUTH_KEY", "test-auth-key"),
+            ("GALEN_CONFIG", config_path.to_str().unwrap()),
+        ]);
+
+        let command = parse_args(args(&["galen", "update"])).unwrap();
+
+        let Command::Update(update) = command else {
+            panic!("expected update command");
+        };
+
+        assert_eq!(update.yara_rules_path, PathBuf::from("env-located-rules"));
     }
 }

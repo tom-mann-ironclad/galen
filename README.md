@@ -113,6 +113,59 @@ Inert files such as EICAR and AMTSO test samples can be used to validate basic d
 
 YARA rules can be added to a `yara/` directory in galen's installation location. YARA Forge's core ruleset is a good starting point. Note that the `galen update` command must be run before any YARA rules will be used.
 
+## Configuration
+
+Every scan and update setting can be set four ways, applied with this precedence:
+
+1. CLI flags (highest priority)
+2. Environment variables
+3. Config file
+4. Built-in defaults (lowest priority)
+
+A setting not provided at a higher layer falls through to the next one, so a config file can set defaults for a whole host while a single invocation still overrides individual flags.
+
+### Config file
+
+By default Galen looks for `./galen.toml` (silently skipping it if absent). Point at a different file with `--config <path>` or the `GALEN_CONFIG` environment variable - either of those makes the file required, so a missing explicit path is an error rather than a silent no-op.
+
+```toml
+[scan]
+database = "/var/lib/galen/signatures.sqlite"
+yara_cache = "/var/lib/galen/yara/galen.yaraxc"
+output = "json"
+max_archive_depth = 5
+max_archive_entries = 10000
+max_decompressed_file_size_bytes = 67108864
+max_file_size_bytes = 67108864
+retained_entry_buffer_limit_bytes = 4194304
+yara_scan_timeout_seconds = 10
+
+[update]
+database = "/var/lib/galen/signatures.sqlite"
+yara_dir = "/var/lib/galen/yara/"
+yara_cache = "/var/lib/galen/yara/galen.yaraxc"
+```
+
+Both tables are optional, as is every key within them. Unknown keys are rejected rather than silently ignored.
+
+### Environment variables
+
+| Variable | Applies to | Equivalent flag |
+| --- | --- | --- |
+| `GALEN_CONFIG` | scan, update | `--config` |
+| `GALEN_DATABASE` | scan, update | `--database` / `-d` |
+| `GALEN_YARA_CACHE` | scan, update | `--yara-cache` / `-y` |
+| `GALEN_YARA_DIR` | update | `--yara-dir` |
+| `GALEN_OUTPUT` | scan | `--output` / `-o` |
+| `GALEN_MAX_ARCHIVE_DEPTH` | scan | `--max-archive-depth` |
+| `GALEN_MAX_ARCHIVE_ENTRIES` | scan | `--max-archive-entries` |
+| `GALEN_MAX_DECOMPRESSED_FILE_SIZE_BYTES` | scan | `--max-decompressed-file-size-bytes` |
+| `GALEN_MAX_FILE_SIZE_BYTES` | scan | `--max-file-size-bytes` |
+| `GALEN_RETAINED_ENTRY_BUFFER_LIMIT_BYTES` | scan | `--retained-entry-buffer-limit-bytes` |
+| `GALEN_YARA_SCAN_TIMEOUT_SECONDS` | scan | `--yara-scan-timeout-seconds` |
+
+`GALEN_AUTH_KEY` (the Malware Bazaar API key) is deliberately not part of this layering and cannot be set via a config file or a CLI flag - it stays environment-variable-only so a secret is never expected to live in a file that might be world-readable or accidentally committed.
+
 ## Current Status
 
 Galen is currently in alpha.
