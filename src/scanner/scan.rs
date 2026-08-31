@@ -1401,6 +1401,15 @@ where
     for i in 0..archive.len() {
         let mut entry = match archive.by_index(i) {
             Ok(entry) => entry,
+            // Some encryption schemes make the `zip` crate fail here, before an
+            // entry handle exists to check via `entry.encrypted()` below - this
+            // is not a scan failure, just an encrypted file we can't read.
+            Err(zip::result::ZipError::UnsupportedArchive(
+                zip::result::ZipError::PASSWORD_REQUIRED,
+            )) => {
+                summary.record_skip(SkipReason::EncryptedFile);
+                continue;
+            }
             Err(err) => {
                 summary.errors += 1;
                 eprintln!(
@@ -1976,6 +1985,19 @@ mod tests {
             writer.start_file(path, options).unwrap();
             writer.write_all(bytes).unwrap();
         }
+
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn zip_bytes_with_encrypted_entry(path: &str, bytes: &[u8]) -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .with_aes_encryption(zip::AesMode::Aes256, "password");
+
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
 
         writer.finish().unwrap().into_inner()
     }
@@ -3626,6 +3648,30 @@ mod tests {
         assert_eq!(summary.archives_scanned, 1);
         assert_eq!(summary.archive_entries_scanned, 0);
         assert_eq!(summary.skip_count(SkipReason::MaxDecompressedBytes), 1);
+    }
+
+    #[test]
+    fn scan_zip_archive_skips_password_protected_entries_without_recording_an_error() {
+        let rules = non_matching_rules();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        let database = HashDatabase::default();
+        let mut summary = ScanSummaryStats::new();
+        let archive = zip_bytes_with_encrypted_entry("secret.bin", b"payload");
+
+        scan_zip_archive(
+            std::io::Cursor::new(archive),
+            Path::new("encrypted.zip"),
+            &database,
+            &mut scanner,
+            &mut summary,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archives_scanned, 1);
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(summary.skip_count(SkipReason::EncryptedFile), 1);
     }
 
     #[test]
