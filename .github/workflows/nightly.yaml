@@ -236,7 +236,7 @@ jobs:
   live-sample-testing:
     name: Live sample testing
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     # Observability only, for now: a missed detection or a scan failure on a
     # real live sample is a more meaningful signal than the ClamAV
     # benchmark's timing numbers, but Malware Bazaar availability and its
@@ -257,7 +257,7 @@ jobs:
       - name: Install job dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends jq unzip
+          sudo apt-get install -y --no-install-recommends jq unzip clamav clamav-freshclam
 
       - name: Build release binary and YARA compiler
         run: |
@@ -282,6 +282,22 @@ jobs:
           key: malware-bazaar-db-${{ steps.date.outputs.date }}
           restore-keys: |
             malware-bazaar-db-
+
+      # Comparison point only (see check-verdicts.sh and README.md
+      # "Benchmarks"): how many of the same live samples ClamAV's own
+      # signatures catch, never a pass/fail gate for this job.
+      - name: Cache ClamAV signature database
+        uses: actions/cache@v5
+        with:
+          path: /var/lib/clamav
+          key: clamav-db-${{ steps.date.outputs.date }}
+          restore-keys: |
+            clamav-db-
+
+      - name: Update ClamAV signatures
+        run: |
+          sudo systemctl stop clamav-freshclam || true
+          sudo freshclam || echo "::warning::freshclam failed; comparing against whatever ClamAV database is available"
 
       - name: Compile local YARA rules
         run: target/release/examples/compile_yara_cache yara/ yara/compiled/galen.yaraxc
@@ -319,12 +335,19 @@ jobs:
             --output json \
             > "$RUNNER_TEMP/live-samples/scan.json" || true
 
+      - name: Scan live samples with ClamAV
+        if: steps.fetch.outputs.skip != 'true'
+        run: |
+          clamscan --recursive --no-summary "$RUNNER_TEMP/live-samples/samples" \
+            > "$RUNNER_TEMP/live-samples/clamav.log" || true
+
       - name: Check verdicts
         if: steps.fetch.outputs.skip != 'true'
         run: |
           scripts/live-samples/check-verdicts.sh \
             --manifest "$RUNNER_TEMP/live-samples/manifest.json" \
             --scan-json "$RUNNER_TEMP/live-samples/scan.json" \
+            --clamav-log "$RUNNER_TEMP/live-samples/clamav.log" \
             --out-dir live-sample-results
 
       - name: Publish summary
