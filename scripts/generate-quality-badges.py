@@ -17,10 +17,51 @@ def badge(label: str, value: float, threshold: float) -> dict[str, object]:
     }
 
 
+def benchmark_badge(benchmark_path: Path | None) -> dict[str, object]:
+    """Build the ClamAV wall-time comparison badge from run-benchmark.sh's output.
+
+    Falls back to an explicit "no data yet" badge rather than omitting the
+    file: nightly.yaml syncs dist/ to Cloudflare R2 with --delete, so a
+    missing badge file here would delete the previous run's badge from R2
+    and 404 the shields.io endpoint instead of degrading gracefully.
+    """
+    if benchmark_path is None or not benchmark_path.exists():
+        return {
+            "schemaVersion": 1,
+            "label": "vs clamav",
+            "message": "no data yet",
+            "color": "lightgrey",
+            "cacheSeconds": 3600,
+        }
+
+    data = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    galen_seconds = float(data["galen"]["wall_seconds"])
+    clamav_seconds = float(data["clamav"]["wall_seconds"])
+    if galen_seconds <= 0:
+        raise ValueError("benchmark report has a non-positive galen wall_seconds")
+
+    ratio = clamav_seconds / galen_seconds
+    if ratio >= 1:
+        message = f"{ratio:.1f}x faster than clamav"
+        color = "brightgreen"
+    else:
+        message = f"{1 / ratio:.1f}x slower than clamav"
+        color = "red"
+
+    return {
+        "schemaVersion": 1,
+        "label": "wall time",
+        "message": message,
+        "color": color,
+        "cacheSeconds": 3600,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mutation", type=Path, required=True)
     parser.add_argument("--coverage-log", type=Path, required=True)
+    parser.add_argument("--benchmark", type=Path, required=False, default=None)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -41,6 +82,7 @@ def main() -> None:
     payloads = {
         "mutation.json": badge("mutation score", mutation_score, 84.5),
         "coverage.json": badge("coverage", coverage, 81.5),
+        "benchmark.json": benchmark_badge(args.benchmark),
     }
     for filename, payload in payloads.items():
         (args.output / filename).write_text(

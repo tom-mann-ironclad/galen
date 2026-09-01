@@ -299,7 +299,20 @@ jobs:
           sudo systemctl stop clamav-freshclam || true
           sudo freshclam || echo "::warning::freshclam failed; comparing against whatever ClamAV database is available"
 
-      - name: Compile local YARA rules
+      # Unlike benchmark-clamav's pinned YARA_FORGE_TAG (pinned for
+      # night-to-night timing comparability), this job wants the freshest
+      # ruleset available: it's testing detection coverage against live,
+      # currently-circulating malware, and a stale ruleset would undercut
+      # that. GitHub's /releases/latest/download alias always resolves to
+      # the newest release's matching asset, no tag bookkeeping required.
+      - name: Fetch latest YARA Forge core ruleset
+        run: |
+          mkdir -p yara
+          curl -sSL -o /tmp/yara-forge-core.zip \
+            "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip"
+          unzip -q -o /tmp/yara-forge-core.zip -d yara/
+
+      - name: Compile YARA rules
         run: target/release/examples/compile_yara_cache yara/ yara/compiled/galen.yaraxc
 
       - name: Fetch live malware samples
@@ -373,7 +386,11 @@ jobs:
         run: rm -rf "$RUNNER_TEMP/live-samples"
 
   deploy-nightly:
-    needs: [regression, quality]
+    # benchmark-clamav is continue-on-error, so a benchmark failure or
+    # timeout still reports "success" to needs and never blocks deployment
+    # - it's only here so the ClamAV comparison badge can pick up its
+    # output below.
+    needs: [regression, quality, benchmark-clamav]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -396,6 +413,17 @@ jobs:
         with:
           name: unit-test-coverage-${{ github.sha }}
           path: quality-results/coverage
+
+      # Soft-fail: benchmark-clamav uploads with if-no-files-found: warn, so
+      # on a bad night this artifact may not exist at all. The badge
+      # generator below handles a missing quality-results/benchmark
+      # directory with an explicit "no data yet" badge rather than failing.
+      - name: Download ClamAV benchmark results
+        uses: actions/download-artifact@v7
+        continue-on-error: true
+        with:
+          name: clamav-benchmark-${{ github.sha }}
+          path: quality-results/benchmark
 
       - name: Import GPG Key
         id: import-gpg
@@ -454,6 +482,7 @@ jobs:
           python3 scripts/generate-quality-badges.py \
             --mutation quality-results/mutation/outcomes.json \
             --coverage-log quality-results/coverage/tarpaulin.log \
+            --benchmark quality-results/benchmark/benchmark.json \
             --output dist/badges
 
       # Sync to the 'nightly/' path. Note the '--delete' flag on both passes 

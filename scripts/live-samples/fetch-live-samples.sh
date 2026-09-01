@@ -66,9 +66,16 @@ manifest_entries="$OUT_DIR/.manifest-entries.jsonl"
 : > "$manifest_entries"
 
 log "requesting recent sample metadata"
+# selector=time (last 60 minutes), not a fixed count: on 2026-09-01, every
+# get_file attempt against selector=100's top-100 candidates returned
+# HTTP 200 with a response that wasn't a valid password-protected zip (no
+# downloadable sample). Temporary fix: only request the freshest window,
+# on the theory that very recently submitted samples are more likely to
+# still be downloadable than older entries in a fixed-count "recent" list.
+# Revisit if this recurs - selector=time can also return zero candidates.
 recent_json="$(curl -sS --fail-with-body -X POST "$MB_API" \
     -H "Auth-Key: $AUTH_KEY" \
-    -d "query=get_recent&selector=100")"
+    -d "query=get_recent&selector=time")"
 
 status="$(jq -r '.query_status // "error"' <<< "$recent_json")"
 if [[ "$status" != "ok" ]]; then

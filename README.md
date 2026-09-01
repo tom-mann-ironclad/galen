@@ -4,6 +4,7 @@
 [![Nightly Packages](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml/badge.svg)](https://github.com/tom-mann-ironclad/galen/actions/workflows/nightly.yaml)
 [![Code Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fpackages.ironclad-software.com%2Fnightly%2Fbadges%2Fcoverage.json&cacheSeconds=3600)](#testing-and-build-assurance)
 [![Mutation Score](https://img.shields.io/endpoint?url=https%3A%2F%2Fpackages.ironclad-software.com%2Fnightly%2Fbadges%2Fmutation.json&cacheSeconds=3600)](#testing-and-build-assurance)
+[![ClamAV Benchmark](https://img.shields.io/endpoint?url=https%3A%2F%2Fpackages.ironclad-software.com%2Fnightly%2Fbadges%2Fbenchmark.json&cacheSeconds=3600)](#benchmarks)
 ![GitHub License](https://img.shields.io/github/license/tom-mann-ironclad/galen)
 
 Galen is an alpha-stage static malware scanner and security intelligence pipeline for Linux, written in Rust.
@@ -506,7 +507,7 @@ Current testing includes:
 
 ZIP, TAR, and GZIP archive parsers are fuzzed in parallel during nightly builds. Each target receives both raw malformed bytes and generated valid containers, uses strict scan limits, and runs for five minutes. Fuzz findings do not block nightly package publication; logs and reproducing inputs are retained as workflow artifacts for investigation. Surviving mutants are also being reviewed and documented where they expose meaningful gaps or deliberate equivalences.
 
-The EICAR and AMTSO fixtures under `test_files/` are inert stand-ins; they say nothing about how galen handles a real, currently-circulating threat. Nightly builds also download a small batch (up to 15) of real, live malware samples from Malware Bazaar (`scripts/live-samples/`), scan them with both galen (after a fresh signature update) and ClamAV, and report how many each flagged. The ClamAV comparison is informational only, in the same spirit as the performance comparison below - it never affects this job's result, only galen's own misses do. Samples are downloaded to the runner's temporary directory, never committed or written into the working tree, and deleted before the job ends regardless of outcome - only hashes, families, and verdicts leave the runner, in an uploaded build artifact and the job summary. This job is observability-only for now (a Malware Bazaar hiccup or fair-use limit can cause an unrelated flake); it does not gate nightly package publication.
+The EICAR and AMTSO fixtures under `test_files/` are inert stand-ins; they say nothing about how galen handles a real, currently-circulating threat. Nightly builds also download a small batch (up to 15) of real, live malware samples from Malware Bazaar (`scripts/live-samples/`), scan them with both galen (after a fresh signature update and the latest YARA Forge core ruleset) and ClamAV, and report how many each flagged. Pulling the latest YARA Forge release each run, rather than a pinned one, keeps this test representative of current detection coverage rather than reproducible timing - the opposite trade-off from the pinned ruleset used for the ClamAV performance comparison below. The ClamAV comparison is informational only, in the same spirit as the performance comparison below - it never affects this job's result, only galen's own misses do. Samples are downloaded to the runner's temporary directory, never committed or written into the working tree, and deleted before the job ends regardless of outcome - only hashes, families, and verdicts leave the runner, in an uploaded build artifact and the job summary. This job is observability-only for now (a Malware Bazaar hiccup or fair-use limit can cause an unrelated flake); it does not gate nightly package publication.
 
 CI and release builds perform checks including:
 
@@ -557,7 +558,7 @@ These measures provide build assurance and traceability. They are not a claim th
 
 ## Benchmarks
 
-The following results come from development runs performed on the same machine.
+The following manual results come from development runs performed on the same machine, before the automated nightly comparison below existed.
 
 They are early engineering measurements, not formal independent performance claims.
 
@@ -567,7 +568,15 @@ They are early engineering measurements, not formal independent performance clai
 | Galen   | YARA enabled |   ~355k |   12m 28s |  ~187 MB |            78,072 |                       19,939 |
 | ClamAV  |    Recursive |   ~300k |   72m 45s | ~1.19 GB |        60,728,859 |                      225,140 |
 
-These numbers came from a one-off manual run and are not reproducible as published. An automated version of this comparison now runs nightly (`.github/workflows/nightly.yaml`, job `benchmark-clamav`) against a smaller, pinned, reproducible corpus (`scripts/bench/`), and its results are uploaded as a build artifact rather than gating the build. Treat the table above as historical context until it is refreshed from that job's output.
+These numbers came from a one-off manual run and are not reproducible as published.
+
+### Automated nightly comparison
+
+An automated version of this comparison runs nightly (`.github/workflows/nightly.yaml`, job `benchmark-clamav`) against a smaller, pinned, reproducible corpus (`scripts/bench/`: a shallow checkout of CPython and Node.js at fixed commits, ~45k files, ~625 MiB), with both hash and YARA detection enabled together. Results are uploaded as a build artifact rather than gating the build.
+
+The **ClamAV Benchmark** badge at the top of this README tracks the most recent run's wall-clock comparison and updates automatically (`scripts/generate-quality-badges.py`, published by the `deploy-nightly` job alongside the coverage and mutation badges). Full figures - memory, page faults, context switches, both scanners' raw output - are in that run's `clamav-benchmark-<commit-sha>` workflow artifact rather than reproduced here, since a hardcoded table would go stale the moment the next nightly run finished.
+
+Both scanners consistently report zero detections against this corpus. Galen's own exit code is consistently 2 (operational error, not detections), not 0, because this pinned corpus contains one of CPython's own test fixtures (`Lib/test/testtar.tar`): a deliberately corrupted tar file used to test `tarfile`'s own error handling. Galen correctly refuses to parse it and counts it as a scan error rather than silently ignoring it, and since the corpus is pinned, this recurs identically every night. A related bug, where password-protected ZIP entries - two of which exist in Node's own zlib test fixtures - were being counted as scan errors instead of the `file_encrypted` skip they should have been, was found and fixed while investigating this; it doesn't change the wall-clock numbers, since the underlying scan work is identical either way.
 
 This comparison is not intended as criticism of ClamAV.
 
